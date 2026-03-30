@@ -3723,7 +3723,14 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description="When True, start transferring each prefill chunk's KV cache "
+        "as soon as its prefill completes, overlapping GPU compute "
+        "with RDMA transfer. Requires enable_chunked_prefill=True and schedule_style=generation_first.")
+
     def _to_pybind(self):
+        # enable_pipelined_transfer is consumed by the Python transceiver only and has no C++ counterpart.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
