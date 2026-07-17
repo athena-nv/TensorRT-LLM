@@ -828,6 +828,9 @@ class Sender(SenderBase):
                 else:
                     dst_block_ids = full_dst_block_ids
 
+                lg_info = extractor.page_table.layer_groups[self_lg]
+                window_size = getattr(lg_info, "sliding_window_size", None)
+
                 # Speculative decoding: generation may have one extra draft-token block.
                 block_diff = dst_block_ids.size - src_block_ids.size
                 if block_diff == 1:
@@ -837,12 +840,22 @@ class Sender(SenderBase):
                     )
                     dst_block_ids = dst_block_ids[:-1]
                 elif block_diff > 1:
+                    logger.error(
+                        "KV block mismatch: "
+                        f"rid={task._unique_rid}, "
+                        f"rank={self._registrar.self_rank_info.instance_rank}, "
+                        f"slice={task.slice_id}, src_layer_group={self_lg}, "
+                        f"dst_layer_group={peer_lg}, token_range={token_range}, "
+                        f"chunk_offset={chunk_offset}, chunk_count={chunk_block_count}, "
+                        f"total_blocks={total_blocks}, src_blocks={src_block_ids.size}, "
+                        f"full_dst_blocks={full_dst_block_ids.size}, "
+                        f"projected_dst_blocks={dst_block_ids.size}, "
+                        f"window_size={window_size}"
+                    )
                     raise ValueError(
                         f"src/dst block count mismatch: {src_block_ids.size} vs "
                         f"{dst_block_ids.size} (expected diff <= 1)"
                     )
-                lg_info = extractor.page_table.layer_groups[self_lg]
-                window_size = getattr(lg_info, "sliding_window_size", None)
 
                 # Block lists are the suffix of [..., slice_end); cached prefix
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.

@@ -537,6 +537,28 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             for block_ids in all_block_ids
         ]
+        kv_cache_map = getattr(self._kv_cache_manager, "kv_cache_map", None)
+        kv_cache = kv_cache_map.get(req.py_request_id) if kv_cache_map is not None else None
+        if kv_cache is not None:
+            for lg_idx, (block_ids, projected_ids) in enumerate(
+                zip(all_block_ids, chunk_block_ids)
+            ):
+                scratch = kv_cache.get_scratch_desc(lg_idx)
+                if scratch is not None and len(projected_ids) == 0:
+                    logger.warning(
+                        "Pipelined KV diagnostic: "
+                        f"rid={rid}, rank={self._dist.rank}, layer_group={lg_idx}, "
+                        f"chunk_tokens=[{chunk_start_pos}, {chunk_end_pos}), "
+                        f"chunk_blocks=[{chunk_start}, {chunk_end}), "
+                        f"remaining_tokens={req.context_remaining_length}, "
+                        f"capacity={kv_cache.capacity}, history_length={kv_cache.history_length}, "
+                        f"scratch_enabled={kv_cache.enable_swa_scratch_reuse}, "
+                        f"has_scratch={kv_cache.has_scratch_slots}, "
+                        f"regular_blocks={len(block_ids)}, "
+                        f"projected_blocks={len(projected_ids)}, "
+                        f"scratch_range=[{int(scratch.range.beg)}, {int(scratch.range.end)}), "
+                        f"scratch_slots={len(scratch.slot_ids)}"
+                    )
         chunk_token_range = None
         if chunk_block_count > 0:
             chunk_token_range = TokenRange(
