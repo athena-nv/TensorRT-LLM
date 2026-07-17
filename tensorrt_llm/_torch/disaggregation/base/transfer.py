@@ -15,19 +15,19 @@ def project_blocks_to_global_chunk(
     block_ids: np.ndarray,
     chunk_block_offset: int,
     chunk_block_count: int,
-    total_blocks: int,
+    resident_block_end: int,
 ) -> np.ndarray:
     """Project a global block chunk into a suffix-resident block list.
 
     ``block_ids`` represents the resident suffix of the logical range
-    ``[0, total_blocks)``.  ``chunk_block_offset`` and ``chunk_block_count``
-    describe a chunk in that global coordinate space.
+    ``[0, resident_block_end)``. ``chunk_block_offset`` and
+    ``chunk_block_count`` describe a chunk in that global coordinate space.
     """
     if chunk_block_count <= 0 or len(block_ids) == 0:
         return block_ids[:0]
 
-    resident_start = max(0, total_blocks - len(block_ids))
-    resident_end = total_blocks
+    resident_start = max(0, resident_block_end - len(block_ids))
+    resident_end = resident_block_end
     chunk_start = chunk_block_offset
     chunk_end = chunk_start + chunk_block_count
 
@@ -64,10 +64,7 @@ def derive_chunk_block_coords(
         return 0, 0
     if tokens_per_block <= 0:
         raise ValueError("tokens_per_block must be positive")
-    if (
-        token_range.start % tokens_per_block != 0
-        or token_range.end % tokens_per_block != 0
-    ):
+    if token_range.start % tokens_per_block != 0 or token_range.end % tokens_per_block != 0:
         raise ValueError(
             f"token_range [{token_range.start}, {token_range.end}) must be "
             f"block-aligned with tokens_per_block={tokens_per_block}"
@@ -120,6 +117,7 @@ class KVSlice:
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
     total_blocks: Optional[int] = None
+
 
 class SessionStatus(Enum):
     """Status of a transfer session.
