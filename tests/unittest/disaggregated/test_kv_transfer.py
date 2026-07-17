@@ -190,7 +190,8 @@ def _send_prefill_chunks(
     transceiver._get_or_create_send_session.return_value = session
     transceiver._create_kv_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
-    transceiver.kv_cache_manager.tokens_per_block = tokens_per_block
+    transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
+    transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._send_reqs = {}
 
     prompt_len = total_blocks * tokens_per_block
@@ -229,8 +230,48 @@ def _send_prefill_chunks(
     return slices
 
 
+def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
+    """A growing source uses the current chunk end while retaining the full prompt span."""
+    tokens_per_block = 128
+    prompt_blocks = 1000
+    chunk_blocks = 16
+
+    transceiver = MagicMock()
+    transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+    transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
+    transceiver._kv_cache_manager.kv_cache_map = {}
+    transceiver._send_reqs = {}
+
+    req = MagicMock()
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+    req.py_request_id = 42
+    req.prompt_len = prompt_blocks * tokens_per_block
+    req.py_beam_width = 1
+
+    for chunk_idx in range(2):
+        chunk_start = chunk_idx * chunk_blocks
+        chunk_end = chunk_start + chunk_blocks
+        resident_ids = np.arange(chunk_end, dtype=np.int64)
+        transceiver._create_kv_slice.return_value = KVSlice(
+            block_ids_per_layer_groups=[resident_ids]
+        )
+        req.py_last_context_chunk = (
+            chunk_start * tokens_per_block,
+            chunk_end * tokens_per_block,
+        )
+        req.context_remaining_length = req.prompt_len - req.py_last_context_chunk[1]
+
+        kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+        assert np.array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            np.arange(chunk_start, chunk_end, dtype=np.int64),
+        )
+        assert kv_slice.total_blocks == prompt_blocks
+
+
 @pytest.mark.parametrize(
-        "all_block_ids,chunk_size_blocks,expected_num_slices",
+    "all_block_ids,chunk_size_blocks,expected_num_slices",
     [
         ([[0, 1, 2, 3, 4, 5, 6, 7]], None, 1),
         ([[0, 1, 2, 3, 4, 5, 6, 7]], 4, 2),
@@ -240,8 +281,7 @@ def _send_prefill_chunks(
     ],
     ids=["no_chunking", "even_split", "uneven_split", "empty_blocks", "chunk_larger_than_total"],
 )
-def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks,
-                                   expected_num_slices):
+def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks, expected_num_slices):
     """Pipelined prefill chunking produces the expected number of slices."""
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks)
     assert len(slices) == expected_num_slices
@@ -253,7 +293,7 @@ def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks,
 
 def test_send_prefill_chunks_integrity_check():
     """Reassembled block IDs from all slices must match the original."""
-    all_block_ids = [list(range(17)), list(range(5))]
+    all_block_ids = [list(range(17)), list(range(17))]
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     for lg_idx, original in enumerate(all_block_ids):
         reassembled = []
@@ -263,13 +303,13 @@ def test_send_prefill_chunks_integrity_check():
 
 
 def test_send_prefill_chunks_multiple_layer_groups():
-    """Shorter layer groups are projected into the overlapping global chunk."""
+    """Each source layer group is a resident suffix ending at the current chunk."""
     all_block_ids = [list(range(8)), list(range(3))]
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
-    assert len(slices[0].block_ids_per_layer_groups[1]) == 0
+    assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
     assert slices[0].token_range == TokenRange(start=0, end=4)
     assert slices[1].token_range == TokenRange(start=4, end=8)
@@ -278,9 +318,7 @@ def test_send_prefill_chunks_multiple_layer_groups():
 def test_send_prefill_chunks_preserves_mamba_state_index():
     """mamba_state_index is propagated to every chunk slice."""
     all_block_ids = [list(range(8))]
-    slices = _send_prefill_chunks(all_block_ids,
-                                  chunk_size_blocks=4,
-                                  mamba_state_index=42)
+    slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4, mamba_state_index=42)
     assert len(slices) == 2
     for s in slices:
         assert s.mamba_state_index == 42
@@ -1824,6 +1862,7 @@ def test_session_has_transferring_tasks_false():
         ctx_transfer_worker.shutdown()
         gen_transfer_worker.shutdown()
 
+
 def add_and_verify_pipelined_request(
     setup,
     ctx_request_id,
@@ -1913,6 +1952,7 @@ def test_transfer_worker_pipelined(
             worker.shutdown()
         for worker in setup["gen_transfer_workers"]:
             worker.shutdown()
+
 
 if __name__ == "__main__":
     test_transfer_worker_v1(1, 1, False, 1, 1, False, False)

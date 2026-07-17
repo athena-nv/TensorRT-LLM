@@ -799,16 +799,12 @@ class Sender(SenderBase):
                 token_range is not None and token_range.start > 0
             )
             chunk_offset, chunk_block_count = (
-                derive_chunk_block_coords(token_range, tpb)
-                if is_chunked
-                else (0, 0)
+                derive_chunk_block_coords(token_range, tpb) if is_chunked else (0, 0)
             )
             # Resident block lists are the suffix of a range ending at the
             # current global chunk boundary when pipelined, or at the full
             # prompt end otherwise. token_start = (suffix_end - n_blocks) * tpb.
-            suffix_end_blocks = (
-                chunk_offset + chunk_block_count if is_chunked else total_blocks
-            )
+            suffix_end_blocks = chunk_offset + chunk_block_count if is_chunked else total_blocks
 
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
@@ -823,7 +819,7 @@ class Sender(SenderBase):
                         dst_projectable_blocks,
                         chunk_block_offset=chunk_offset,
                         chunk_block_count=chunk_block_count,
-                        total_blocks=total_blocks,
+                        resident_block_end=total_blocks,
                     )
                 else:
                     dst_block_ids = full_dst_block_ids

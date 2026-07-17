@@ -121,10 +121,34 @@ def test_chunk_projection_noops_when_chunk_is_outside_short_layer_group():
         block_ids,
         chunk_block_offset=4,
         chunk_block_count=4,
-        total_blocks=3,
+        resident_block_end=3,
     )
 
     assert projected_ids.size == 0
+
+
+@pytest.mark.parametrize(
+    "resident_block_end,chunk_block_offset,expected",
+    [
+        (16, 0, np.arange(16, dtype=np.int64)),
+        (32, 16, np.arange(16, 32, dtype=np.int64)),
+    ],
+    ids=["first_chunk", "later_chunk"],
+)
+def test_chunk_projection_maps_incrementally_allocated_source(
+    resident_block_end, chunk_block_offset, expected
+):
+    """Source blocks end at the current chunk, not at the full prompt."""
+    block_ids = np.arange(resident_block_end, dtype=np.int64)
+
+    projected_ids = project_blocks_to_global_chunk(
+        block_ids,
+        chunk_block_offset=chunk_block_offset,
+        chunk_block_count=16,
+        resident_block_end=resident_block_end,
+    )
+
+    assert np.array_equal(projected_ids, expected)
 
 
 def test_chunk_projection_maps_prefix_reuse_suffix_by_overlap():
@@ -135,13 +159,13 @@ def test_chunk_projection_maps_prefix_reuse_suffix_by_overlap():
         block_ids,
         chunk_block_offset=0,
         chunk_block_count=4,
-        total_blocks=8,
+        resident_block_end=8,
     )
     second_chunk = project_blocks_to_global_chunk(
         block_ids,
         chunk_block_offset=4,
         chunk_block_count=4,
-        total_blocks=8,
+        resident_block_end=8,
     )
 
     assert first_chunk.size == 0
@@ -311,8 +335,10 @@ def test_rx_session_status_error_on_any_failure():
 
 
 def test_rx_session_process_aux_completes_at_expected_transfers():
-    """Aux completes only once _aux_count reaches the RxSession's single
-    task's expected_transfers (the receiver always has exactly one task)."""
+    """Aux completes only once the expected transfer count is reached.
+
+    The receiver always has exactly one task.
+    """
     session = _make_rx_session(1)
     session._kv_tasks[0].expected_transfers = 2
 
@@ -375,6 +401,7 @@ def test_rx_session_mid_chunk_failure():
     result = session.wait_complete()
     assert result == WaitResult.FAILED
 
+
 # ---------------------------------------------------------------------------
 # Pipelined transfer tests
 # ---------------------------------------------------------------------------
@@ -391,6 +418,7 @@ def test_pipelined_transfer_disabled_by_default():
     result = KvCacheTransceiverV2.pipeline_transfer_enabled.fget(transceiver)
     assert result is False
 
+
 def test_pipelined_transfer_requires_chunked_prefill():
     """ValueError when pipelined transfer is enabled without chunked prefill."""
     from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
@@ -401,9 +429,8 @@ def test_pipelined_transfer_requires_chunked_prefill():
     )
 
     with pytest.raises(
-            ValueError,
-            match=
-            "enable_chunked_prefill is required when enable_pipelined_transfer is set."
+        ValueError,
+        match="enable_chunked_prefill is required when enable_pipelined_transfer is set.",
     ):
         create_kv_cache_transceiver(
             MagicMock(),
@@ -413,6 +440,7 @@ def test_pipelined_transfer_requires_chunked_prefill():
             cache_transceiver_config,
             enable_chunked_prefill=False,
         )
+
 
 def test_pipelined_transfer_requires_gen_first_flow():
     """ValueError when a real request is not using gen-first flow."""
@@ -428,12 +456,12 @@ def test_pipelined_transfer_requires_gen_first_flow():
     request.sampling_config = None
     request.py_beam_width = 1
     request.py_disaggregated_params = SimpleNamespace(
-        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST)
+        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+    )
 
     with pytest.raises(
-            ValueError,
-            match=
-            "schedule_style must be generation_first when enable_pipelined_transfer is set."
+        ValueError,
+        match="schedule_style must be generation_first when enable_pipelined_transfer is set.",
     ):
         PyExecutor._validate_request(executor, request)
 
