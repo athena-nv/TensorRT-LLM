@@ -564,32 +564,38 @@ class Sender(SenderBase):
                 write_meta,
                 lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
             )
-            if timer:
-                timer.record_transfer_start(write_meta.peer_rank)
-            try:
-                status = self._agent.submit_transfer_requests(request)
-                if not status.wait():
-                    agent_result = AgentResult.FAILED
-                    last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
-                    agent_name = getattr(self._agent, "name", "<?>")
-                    detail = (
-                        f"KV transfer agent failed: "
-                        f"unique_rid={write_meta.unique_rid} "
-                        f"slice={write_meta.slice_id} "
-                        f"peer_rank={write_meta.peer_rank} "
-                        f"peer_endpoint={write_meta.peer_endpoint} "
-                        f"op={getattr(request, 'op', '?')} "
-                        f"remote={getattr(request, 'remote_name', '?')} "
-                        f"src_size={int(write_meta.src_ptrs.size)} "
-                        f"dst_size={int(write_meta.dst_ptrs.size)} "
-                        f"nixl_status={last_status} agent={agent_name}"
-                    )
-                    logger.error(detail)
-                    task.fail(RuntimeError(detail))
-            finally:
-                if send_slot_id is not None:
-                    self._bounce.release_send(send_slot_id)
-        if timer:
+            with nvtx_range(
+                f"nixl_kv_transfer unique_rid={write_meta.unique_rid} "
+                f"peer_rank={write_meta.peer_rank}"
+            ):
+                if timer:
+                    timer.record_transfer_start(write_meta.peer_rank)
+                try:
+                    status = self._agent.submit_transfer_requests(request)
+                    if not status.wait():
+                        agent_result = AgentResult.FAILED
+                        last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
+                        agent_name = getattr(self._agent, "name", "<?>")
+                        detail = (
+                            f"KV transfer agent failed: "
+                            f"unique_rid={write_meta.unique_rid} "
+                            f"slice={write_meta.slice_id} "
+                            f"peer_rank={write_meta.peer_rank} "
+                            f"peer_endpoint={write_meta.peer_endpoint} "
+                            f"op={getattr(request, 'op', '?')} "
+                            f"remote={getattr(request, 'remote_name', '?')} "
+                            f"src_size={int(write_meta.src_ptrs.size)} "
+                            f"dst_size={int(write_meta.dst_ptrs.size)} "
+                            f"nixl_status={last_status} agent={agent_name}"
+                        )
+                        logger.error(detail)
+                        task.fail(RuntimeError(detail))
+                finally:
+                    if send_slot_id is not None:
+                        self._bounce.release_send(send_slot_id)
+                if timer:
+                    timer.record_transfer_end(write_meta.peer_rank)
+        elif timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
         # Intermediate chunk results are sent (not suppressed) so that RDMA
@@ -675,13 +681,17 @@ class Sender(SenderBase):
         agent_result = AgentResult.SUCCESS
         if write_meta.src_ptrs.size > 0:
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
-            if timer:
-                timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
-                agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
-            if timer:
-                timer.record_transfer_end(write_meta.peer_rank)
+            with nvtx_range(
+                f"nixl_aux_transfer unique_rid={write_meta.unique_rid} "
+                f"peer_rank={write_meta.peer_rank}"
+            ):
+                if timer:
+                    timer.record_transfer_start(write_meta.peer_rank)
+                if not self._agent.submit_transfer_requests(request).wait():
+                    agent_result = AgentResult.FAILED
+                    session.set_exception("aux transfer agent request failed")
+                if timer:
+                    timer.record_transfer_end(write_meta.peer_rank)
 
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
