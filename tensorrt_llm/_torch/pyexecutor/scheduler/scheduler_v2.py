@@ -584,6 +584,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
             return ScheduleAction.SKIP, 0, False
 
+        # ATHENAC
+        # FIXME: is req.py_last_context_chunk set properly or should we set it here?
+        # if req.prepopulated_prompt_len > 0 and self.transceiver.pipeline_transfer_enabled:
+        #     self.transceiver.respond_and_send_async(req)
+        logger.info(f"req {req.py_request_id} prepopulated_prompt_len: {req.prepopulated_prompt_len}")
+
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
         context_remaining = req.context_remaining_length

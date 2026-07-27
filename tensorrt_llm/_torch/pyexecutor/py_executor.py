@@ -4386,6 +4386,8 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
+                    self._send_cache(
+                        scheduled_batch.scheduled_requests.all_requests())
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -5118,6 +5120,8 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        logger.info("PyExecutor._schedule() called")
+
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -5686,6 +5690,15 @@ class PyExecutor:
 
         return
 
+    @nvtx_range("_send_cache")
+    def _send_cache(self, scheduled_requests: List[LlmRequest]):
+        logger.info("PyExecutor._send_cache() called")
+        if self.kv_cache_transceiver:
+            for req in scheduled_requests:
+                if req.is_context_only_request and req.prompt_len > 0 and not req.is_finished_due_to_cancellation:
+                        logger.info("PyExecutor._send_cache()sending cache early for request %s", req.py_request_id)
+                        self.kv_cache_transceiver.respond_and_send_async(req)
+
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
 
@@ -5701,6 +5714,7 @@ class PyExecutor:
                         req, cache_block_ids):
                     self.async_transfer_manager.start_transfer(req)
 
+        logger.info("PyExecutor._send_kv_async() called")
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
                 if req.is_context_only_request and not req.is_finished_due_to_cancellation:

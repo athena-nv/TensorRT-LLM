@@ -571,6 +571,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
+    # ATHENAC
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start background KV cache transfer to the generation server.
 
