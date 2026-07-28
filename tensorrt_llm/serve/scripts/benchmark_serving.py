@@ -18,6 +18,7 @@ On the client side, run:
 """
 import argparse
 import asyncio
+import csv
 import gc
 import json
 import os
@@ -558,6 +559,9 @@ async def benchmark(
         "e2els": [output.latency for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_ids": [output.request_id for output in outputs],
+        "ctx_request_ids": [output.ctx_request_id for output in outputs],
+        "successes": [output.success for output in outputs],
     }
 
     if metrics.total_energy_j is not None:
@@ -698,7 +702,10 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "e2els", "generated_texts", "errors"]
+    ignored_metrics = [
+        "ttfts", "itls", "e2els", "generated_texts", "errors", "request_ids",
+        "ctx_request_ids", "successes"
+    ]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
@@ -762,6 +769,62 @@ async def fetch_perf_metrics(base_url: str) -> dict:
         except Exception as e:
             print(f"Error fetching performance metrics: {e}")
             return {}
+
+
+def save_request_mapping(result_dir: Optional[str], benchmark_run: str,
+                         concurrency: Optional[int],
+                         results: dict[str, Any]) -> str:
+    """Save exact client-to-context request correlation for a benchmark."""
+    mapping_dir = result_dir or "."
+    mapping_path = os.path.join(mapping_dir, "request_mapping.csv")
+    request_ids = results["request_ids"]
+    ctx_request_ids = results["ctx_request_ids"]
+    ttfts = results["ttfts"]
+    successes = results["successes"]
+    if not (len(request_ids) == len(ctx_request_ids) == len(ttfts) ==
+            len(successes)):
+        raise ValueError("Per-request benchmark result lengths do not match")
+
+    round_size = concurrency if concurrency is not None and concurrency > 0 else len(
+        request_ids)
+    with open(mapping_path, "w", encoding="utf-8", newline="") as mapping_file:
+        writer = csv.DictWriter(
+            mapping_file,
+            fieldnames=[
+                "benchmark_run",
+                "benchmark_round",
+                "concurrency",
+                "client_request_index",
+                "client_request_id",
+                "ctx_request_id",
+                "client_ttft_ms",
+                "status",
+            ],
+        )
+        writer.writeheader()
+        for request_index, (request_id, ctx_request_id, ttft,
+                            success) in enumerate(
+                                zip(request_ids, ctx_request_ids, ttfts,
+                                    successes)):
+            writer.writerow({
+                "benchmark_run":
+                benchmark_run,
+                "benchmark_round":
+                request_index // round_size + 1 if round_size else 1,
+                "concurrency":
+                concurrency if concurrency is not None else "",
+                "client_request_index":
+                request_index,
+                "client_request_id":
+                request_id if request_id is not None else "",
+                "ctx_request_id":
+                ctx_request_id if ctx_request_id is not None else "",
+                "client_ttft_ms":
+                ttft * MILLISECONDS_TO_SECONDS_CONVERSION if success else "",
+                "status":
+                "success" if success else "failed",
+            })
+    return mapping_path
 
 
 def main(args: argparse.Namespace):
@@ -1017,11 +1080,18 @@ def main(args: argparse.Namespace):
         # Merge with benchmark result
         result_json = {**result_json, **benchmark_result}
 
+        benchmark_run = (os.path.dirname(os.path.abspath(args.result_dir))
+                         if args.result_dir else current_dt)
+        mapping_path = save_request_mapping(args.result_dir, benchmark_run,
+                                            args.max_concurrency, result_json)
+        print(f"Request mapping saved to: {mapping_path}")
+
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
                     "input_lens", "output_lens", "ttfts", "itls", "e2els",
-                    "generated_texts", "errors"
+                    "generated_texts", "errors", "request_ids",
+                    "ctx_request_ids", "successes"
             ]:
                 if field in result_json:
                     del result_json[field]

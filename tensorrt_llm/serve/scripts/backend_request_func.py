@@ -68,6 +68,20 @@ class RequestFuncOutput:
     error: str = ""
     avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
     exception_type: str = None  # unset
+    request_id: Optional[str] = None
+    ctx_request_id: Optional[int] = None
+
+
+def _capture_request_identifiers(output: RequestFuncOutput, data: dict) -> None:
+    """Capture client and disaggregated request IDs from an OpenAI response."""
+    if request_id := data.get("id"):
+        output.request_id = request_id
+    choices = data.get("choices") or []
+    if not choices:
+        return
+    disaggregated_params = choices[0].get("disaggregated_params") or {}
+    if (ctx_request_id := disaggregated_params.get("ctx_request_id")) is not None:
+        output.ctx_request_id = ctx_request_id
 
 
 async def async_request_trt_llm(
@@ -213,6 +227,7 @@ async def async_request_openai_completions(
                     first_chunk_received = False
                     async for chunk in _iter_sse_data(response.content):
                         data = json.loads(chunk)
+                        _capture_request_identifiers(output, data)
 
                         # NOTE: Some completion API might have a last
                         # usage summary response without a token so we
@@ -255,6 +270,7 @@ async def async_request_openai_completions(
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
+                    _capture_request_identifiers(output, data)
                     generated_text = data["choices"][0]["text"]
                     output.success = True
                     output.generated_text = generated_text
