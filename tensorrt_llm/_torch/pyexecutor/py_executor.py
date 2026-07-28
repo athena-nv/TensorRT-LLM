@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import threading
 import time
@@ -3941,6 +3942,31 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
+                    early_kv_cache_request_ids = self._send_kv_cache_early(
+                        scheduled_batch.context_requests)
+                    # region agent log
+                    with open(
+                        "/home/scratch.athenac_coreai/TensorRT-LLM/.cursor/debug-9d5c73.log",
+                        "a",
+                        encoding="utf-8",
+                    ) as _debug_file:
+                        _debug_file.write(
+                            json.dumps({
+                                "sessionId": "9d5c73",
+                                "runId": "post-fix",
+                                "hypothesisId": "A",
+                                "location":
+                                "py_executor.py:_executor_loop",
+                                "message":
+                                "Ran non-overlap early KV transfer",
+                                "data": {
+                                    "sentRequestIds":
+                                    sorted(early_kv_cache_request_ids),
+                                },
+                                "timestamp": int(time.time() * 1000),
+                            }) + "\n")
+                    # endregion
+
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
@@ -4385,9 +4411,10 @@ class PyExecutor:
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
+                early_kv_cache_request_ids: set[int] = set()
                 if can_queue:
-                    self._send_cache(
-                        scheduled_batch.scheduled_requests.all_requests())
+                    early_kv_cache_request_ids = self._send_kv_cache_early(
+                        scheduled_batch.context_requests)
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -4467,8 +4494,12 @@ class PyExecutor:
                             self.previous_batch.sample_state,
                             iteration_id=self.iter_counter)
 
-                    self._send_kv_async(
+                    previous_requests = (
                         self.previous_batch.scheduled_requests.all_requests())
+                    self._send_kv_async([
+                        req for req in previous_requests
+                        if req.py_request_id not in early_kv_cache_request_ids
+                    ])
 
                 if self.enable_early_first_token_response:
                     if self.previous_batch is not None and should_process_previous_batch:
@@ -4752,14 +4783,14 @@ class PyExecutor:
                 and self.kv_cache_transceiver.pipeline_transfer_enabled):
             if request.py_beam_width != 1:
                 raise ValueError(
-                    "beam_width > 1 is not supported when enable_pipelined_transfer is set.")
+                    "beam_width > 1 is not supported when enable_pipelined_transfer is set."
+                )
 
             disagg_params = request.py_disaggregated_params
             if (disagg_params is None or disagg_params.schedule_style
                     != DisaggScheduleStyle.GENERATION_FIRST):
-                raise ValueError(
-                    "schedule_style must be generation_first when "
-                    "enable_pipelined_transfer is set.")
+                raise ValueError("schedule_style must be generation_first when "
+                                 "enable_pipelined_transfer is set.")
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
@@ -5120,8 +5151,6 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        logger.info("PyExecutor._schedule() called")
-
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -5690,14 +5719,62 @@ class PyExecutor:
 
         return
 
-    @nvtx_range("_send_cache")
-    def _send_cache(self, scheduled_requests: List[LlmRequest]):
-        logger.info("PyExecutor._send_cache() called")
-        if self.kv_cache_transceiver:
-            for req in scheduled_requests:
-                if req.is_context_only_request and req.prompt_len > 0 and not req.is_finished_due_to_cancellation:
-                        logger.info("PyExecutor._send_cache()sending cache early for request %s", req.py_request_id)
-                        self.kv_cache_transceiver.respond_and_send_async(req)
+    @nvtx_range("_send_kv_cache_early")
+    def _send_kv_cache_early(self,
+                             scheduled_requests: List[LlmRequest]) -> set[int]:
+        """Send completed context chunks before the next overlap forward."""
+        # region agent log
+        with open(
+            "/home/scratch.athenac_coreai/TensorRT-LLM/.cursor/debug-9d5c73.log",
+            "a",
+            encoding="utf-8",
+        ) as _debug_file:
+            _debug_file.write(
+                json.dumps({
+                    "sessionId":
+                    "9d5c73",
+                    "runId":
+                    "pre-fix",
+                    "hypothesisId":
+                    "A,B",
+                    "location":
+                    "py_executor.py:_send_kv_cache_early",
+                    "message":
+                    "Evaluating early KV transfer candidates",
+                    "data": {
+                        "pipelineEnabled":
+                        (self.kv_cache_transceiver is not None
+                         and self.kv_cache_transceiver.
+                         pipeline_transfer_enabled),
+                        "requests": [{
+                            "requestId":
+                            req.py_request_id,
+                            "isContextOnly":
+                            req.is_context_only_request,
+                            "cancelled":
+                            req.is_finished_due_to_cancellation,
+                            "lastChunkRange":
+                            list(req.py_last_context_chunk),
+                        } for req in scheduled_requests],
+                    },
+                    "timestamp":
+                    int(time.time() * 1000),
+                }) + "\n")
+        # endregion
+        if (self.kv_cache_transceiver is None
+                or not self.kv_cache_transceiver.pipeline_transfer_enabled):
+            return set()
+
+        requests = [
+            req for req in scheduled_requests if req.is_context_only_request
+            and not req.is_finished_due_to_cancellation
+            and req.py_last_context_chunk[0] is not None
+        ]
+        if not requests:
+            return set()
+
+        self._send_kv_async(requests)
+        return {req.py_request_id for req in requests}
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
@@ -5714,11 +5791,10 @@ class PyExecutor:
                         req, cache_block_ids):
                     self.async_transfer_manager.start_transfer(req)
 
-        logger.info("PyExecutor._send_kv_async() called")
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
                 if req.is_context_only_request and not req.is_finished_due_to_cancellation:
-                    if req.is_context_finished or req.is_finished_due_to_length:   # noqa: E501
+                    if req.is_context_finished or req.is_finished_due_to_length:  # noqa: E501
                         # Forward is done for this request — release the
                         # IndexMapper slot so new requests can reuse it.
                         # KV blocks stay allocated for the upcoming transfer.
@@ -5963,6 +6039,34 @@ class PyExecutor:
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
+                # region agent log
+                with open(
+                    "/home/scratch.athenac_coreai/TensorRT-LLM/.cursor/debug-9d5c73.log",
+                    "a",
+                    encoding="utf-8",
+                ) as _debug_file:
+                    _debug_file.write(
+                        json.dumps({
+                            "sessionId": "9d5c73",
+                            "runId": "pre-fix",
+                            "hypothesisId": "A",
+                            "location":
+                            "py_executor.py:_update_request_states_tp",
+                            "message":
+                            "Advancing completed context chunk",
+                            "data": {
+                                "requestId":
+                                request.py_request_id,
+                                "previousLastChunkRange":
+                                list(request.py_last_context_chunk),
+                                "currentPosition":
+                                request.context_current_position,
+                                "contextChunkSize":
+                                request.context_chunk_size,
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }) + "\n")
+                # endregion
                 request.py_last_context_chunk = (
                     request.context_current_position,
                     request.context_current_position +

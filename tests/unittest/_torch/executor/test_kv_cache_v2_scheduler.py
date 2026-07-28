@@ -81,6 +81,8 @@ def make_ctx_request(
     req.is_first_context_chunk = is_first_context_chunk
     req.is_last_context_chunk = is_last_context_chunk
     req.context_chunk_size = 0
+    req.prepopulated_prompt_len = 0
+    req.py_last_context_chunk = (None, None)
     req.lora_task_id = lora_task_id
     req.is_context_init_state = True
     req.is_generation_in_progress_state = False
@@ -1528,6 +1530,34 @@ class TestChunkedContext:
         req = make_ctx_request(0, context_remaining_length=200, is_first_context_chunk=False)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
+
+    def test_reused_prefix_is_available_for_early_transfer(self):
+        def prepare_context(req):
+            req.context_current_position = 128
+            req.context_remaining_length = 72
+            req.prepopulated_prompt_len = 128
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=64, prepare_context_fn=prepare_context)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=200)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.py_last_context_chunk == (0, 128)
+
+    def test_reused_prefix_does_not_overwrite_completed_chunk(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=72, is_first_context_chunk=False)
+        req.prepopulated_prompt_len = 128
+        req.py_last_context_chunk = (128, 192)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.py_last_context_chunk == (128, 192)
 
 
 # ===========================================================================

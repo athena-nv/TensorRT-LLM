@@ -561,6 +561,38 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 start=chunk_start * tpb,
                 end=(chunk_start + chunk_block_count) * tpb,
             )
+        # region agent log
+        with open(
+            "/home/scratch.athenac_coreai/TensorRT-LLM/.cursor/debug-9d5c73.log",
+            "a",
+            encoding="utf-8",
+        ) as _debug_file:
+            _debug_file.write(
+                __import__("json").dumps(
+                    {
+                        "sessionId": "9d5c73",
+                        "runId": "pre-fix",
+                        "hypothesisId": "C,D",
+                        "location": "transceiver.py:_build_prefill_chunk",
+                        "message": "Built pipelined KV slice",
+                        "data": {
+                            "requestId": req.py_request_id,
+                            "rid": rid,
+                            "chunkTokenStart": chunk_start_pos,
+                            "chunkTokenEnd": chunk_end_pos,
+                            "chunkBlockStart": chunk_start,
+                            "chunkBlockEnd": chunk_end,
+                            "remaining": req.context_remaining_length,
+                            "sourceBlockCounts": [len(ids) for ids in all_block_ids],
+                            "projectedBlockCounts": [len(ids) for ids in chunk_block_ids],
+                            "isLast": is_last_chunk,
+                        },
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+        # endregion
 
         return KVSlice(
             is_last_slice=is_last_chunk,
@@ -571,7 +603,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
-    # ATHENAC
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start background KV cache transfer to the generation server.
 

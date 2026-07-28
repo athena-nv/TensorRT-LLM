@@ -466,6 +466,49 @@ def test_pipelined_transfer_requires_gen_first_flow():
         PyExecutor._validate_request(executor, request)
 
 
+def test_send_kv_cache_early_only_sends_completed_chunks():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+
+    completed = SimpleNamespace(
+        py_request_id=1,
+        is_context_only_request=True,
+        is_finished_due_to_cancellation=False,
+        py_last_context_chunk=(0, 64),
+    )
+    first_chunk = SimpleNamespace(
+        py_request_id=2,
+        is_context_only_request=True,
+        is_finished_due_to_cancellation=False,
+        py_last_context_chunk=(None, None),
+    )
+    cancelled = SimpleNamespace(
+        py_request_id=3,
+        is_context_only_request=True,
+        is_finished_due_to_cancellation=True,
+        py_last_context_chunk=(0, 64),
+    )
+
+    sent_request_ids = PyExecutor._send_kv_cache_early(
+        executor, [completed, first_chunk, cancelled]
+    )
+
+    executor._send_kv_async.assert_called_once_with([completed])
+    assert sent_request_ids == {1}
+
+
+def test_send_kv_cache_early_requires_pipelined_transfer():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = False
+
+    assert PyExecutor._send_kv_cache_early(executor, []) == set()
+    executor._send_kv_async.assert_not_called()
+
+
 def test_pipelined_last_chunk_sends_and_finalizes():
     """respond_and_send_async sends the built chunk and finalizes on the last chunk."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2

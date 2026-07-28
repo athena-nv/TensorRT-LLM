@@ -584,11 +584,38 @@ class KVCacheV2Scheduler(RequestScheduler):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
             return ScheduleAction.SKIP, 0, False
 
-        # ATHENAC
-        # FIXME: is req.py_last_context_chunk set properly or should we set it here?
-        # if req.prepopulated_prompt_len > 0 and self.transceiver.pipeline_transfer_enabled:
-        #     self.transceiver.respond_and_send_async(req)
-        logger.info(f"req {req.py_request_id} prepopulated_prompt_len: {req.prepopulated_prompt_len}")
+        # A block-reused prefix is already complete and can be transferred
+        # while the first context chunk is computed.
+        if req.is_first_context_chunk and req.prepopulated_prompt_len > 0:
+            req.py_last_context_chunk = (0, req.prepopulated_prompt_len)
+        # region agent log
+        with open(
+            "/home/scratch.athenac_coreai/TensorRT-LLM/.cursor/debug-9d5c73.log",
+            "a",
+            encoding="utf-8",
+        ) as _debug_file:
+            _debug_file.write(
+                __import__("json").dumps(
+                    {
+                        "sessionId": "9d5c73",
+                        "runId": "pre-fix",
+                        "hypothesisId": "A,C",
+                        "location": "scheduler_v2.py:_try_schedule_context_chunked",
+                        "message": "Context prepared for scheduling",
+                        "data": {
+                            "requestId": req.py_request_id,
+                            "isFirst": req.is_first_context_chunk,
+                            "prepopulated": req.prepopulated_prompt_len,
+                            "currentPosition": req.context_current_position,
+                            "remaining": req.context_remaining_length,
+                            "lastChunkRange": list(req.py_last_context_chunk),
+                        },
+                        "timestamp": int(__import__("time").time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+        # endregion
 
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
