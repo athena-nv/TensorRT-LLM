@@ -254,6 +254,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 

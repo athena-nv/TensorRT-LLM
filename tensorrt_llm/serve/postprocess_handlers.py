@@ -543,12 +543,15 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         delta_text = output.text_diff
         if args.echo and args.first_iteration:
             delta_text = args.prompt + delta_text
+        disaggregated_params = (to_disaggregated_params(
+            output.disaggregated_params) if args.first_iteration else None)
         choice = CompletionResponseStreamChoice(
             index=args.prompt_idx * args.num_choices + output.index,
             text=delta_text if args.detokenize else "",
             token_ids=None if args.detokenize else output.token_ids_diff,
             finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
+            disaggregated_params=disaggregated_params,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
