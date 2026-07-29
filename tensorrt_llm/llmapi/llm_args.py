@@ -3727,7 +3727,8 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=False,
         description="When True, start transferring each prefill chunk's KV cache "
         "as soon as its prefill completes, overlapping GPU compute "
-        "with RDMA transfer. Requires enable_chunked_prefill=True and schedule_style=generation_first.")
+        "with cache transfer. Requires enable_chunked_prefill=True and "
+        "schedule_style=generation_first and pipeline_parallel_size=1.")
 
     def _to_pybind(self):
         # enable_pipelined_transfer is consumed by the Python transceiver only and has no C++ counterpart.

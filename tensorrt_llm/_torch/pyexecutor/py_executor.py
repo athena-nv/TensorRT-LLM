@@ -4750,14 +4750,14 @@ class PyExecutor:
                 and self.kv_cache_transceiver.pipeline_transfer_enabled):
             if request.py_beam_width != 1:
                 raise ValueError(
-                    "beam_width > 1 is not supported when enable_pipelined_transfer is set.")
+                    "beam_width > 1 is not supported when enable_pipelined_transfer is set."
+                )
 
             disagg_params = request.py_disaggregated_params
             if (disagg_params is None or disagg_params.schedule_style
                     != DisaggScheduleStyle.GENERATION_FIRST):
-                raise ValueError(
-                    "schedule_style must be generation_first when "
-                    "enable_pipelined_transfer is set.")
+                raise ValueError("schedule_style must be generation_first when "
+                                 "enable_pipelined_transfer is set.")
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
@@ -5704,7 +5704,7 @@ class PyExecutor:
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
                 if req.is_context_only_request and not req.is_finished_due_to_cancellation:
-                    if req.is_context_finished or req.is_finished_due_to_length:   # noqa: E501
+                    if req.is_context_finished or req.is_finished_due_to_length:
                         # Forward is done for this request — release the
                         # IndexMapper slot so new requests can reuse it.
                         # KV blocks stay allocated for the upcoming transfer.

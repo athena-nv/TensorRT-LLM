@@ -492,11 +492,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self,
         req: LlmRequest,
     ) -> KVSlice:
-        """Send one prefill chunk's KV data during ongoing prefill.
-
-        Called after each prefill chunk completes, before the next chunk's
-        forward begins. Creates the TxSession on the first call for a request
-        and adds slices incrementally.
+        """
+        Create a KVSlice for a prefill chunk. Project the block IDs to the global chunk.
 
         Args:
             req: The context-only request being prefilled.
@@ -515,7 +512,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         base_slice = self._create_kv_slice(req)
         all_block_ids = base_slice.block_ids_per_layer_groups
-        tpb = self._reuse_adapter.tokens_per_block
         # Keep the full prompt span for destination projection. Source block
         # lists grow only through the current chunk boundary.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
