@@ -74,19 +74,20 @@ def create_kv_cache_transceiver(
     if (cache_transceiver_config.enable_pipelined_transfer
             and not enable_chunked_prefill):
         raise ValueError(
-            "enable_chunked_prefill is required when enable_pipelined_transfer is set.")
+            "enable_chunked_prefill is required when enable_pipelined_transfer is set."
+        )
     if (cache_transceiver_config.enable_pipelined_transfer
             and mapping.pp_size != 1):
         raise ValueError(
-            "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set.")
+            "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set."
+        )
     # Auto-select Python transceiver when enable_pipelined_transfer is set,
     # since the C++ transceiver does not support pipelined transfer.
     # Only applies to NIXL/DEFAULT backends (the Python transceiver
     # does not support UCX, MPI, or MOONCAKE).
     runtime = cache_transceiver_config.transceiver_runtime
     use_python = runtime == "PYTHON"
-    if (runtime is None
-            and cache_transceiver_config.enable_pipelined_transfer):
+    if (runtime is None and cache_transceiver_config.enable_pipelined_transfer):
         if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
             logger.warning(
                 "enable_pipelined_transfer is set; auto-selecting the Python "
@@ -104,7 +105,8 @@ def create_kv_cache_transceiver(
           and cache_transceiver_config.enable_pipelined_transfer):
         raise ValueError(
             "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
-            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer.")
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
+        )
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)

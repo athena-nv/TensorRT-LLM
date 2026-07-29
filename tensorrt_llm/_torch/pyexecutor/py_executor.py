@@ -4750,14 +4750,14 @@ class PyExecutor:
                 and self.kv_cache_transceiver.pipeline_transfer_enabled):
             if request.py_beam_width != 1:
                 raise ValueError(
-                    "beam_width > 1 is not supported when enable_pipelined_transfer is set.")
+                    "beam_width > 1 is not supported when enable_pipelined_transfer is set."
+                )
 
             disagg_params = request.py_disaggregated_params
             if (disagg_params is None or disagg_params.schedule_style
                     != DisaggScheduleStyle.GENERATION_FIRST):
-                raise ValueError(
-                    "schedule_style must be generation_first when "
-                    "enable_pipelined_transfer is set.")
+                raise ValueError("schedule_style must be generation_first when "
+                                 "enable_pipelined_transfer is set.")
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)

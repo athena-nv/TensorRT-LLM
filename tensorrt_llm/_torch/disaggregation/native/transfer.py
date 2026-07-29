@@ -549,9 +549,7 @@ class Sender(SenderBase):
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
             # is_last=True ensures the receiver resolves its task event.
-            self._send_kv_result_to_receiver(
-                write_meta, is_last=True, result=AgentResult.FAILED
-            )
+            self._send_kv_result_to_receiver(write_meta, is_last=True, result=AgentResult.FAILED)
             return
 
         from .bounce import build_send_request, encode_result_tail
