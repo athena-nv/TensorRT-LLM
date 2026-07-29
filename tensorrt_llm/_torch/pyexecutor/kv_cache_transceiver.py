@@ -75,6 +75,10 @@ def create_kv_cache_transceiver(
             and not enable_chunked_prefill):
         raise ValueError(
             "enable_chunked_prefill is required when enable_pipelined_transfer is set.")
+    if (cache_transceiver_config.enable_pipelined_transfer
+            and mapping.pp_size != 1):
+        raise ValueError(
+            "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set.")
     # Auto-select Python transceiver when enable_pipelined_transfer is set,
     # since the C++ transceiver does not support pipelined transfer.
     # Only applies to NIXL/DEFAULT backends (the Python transceiver

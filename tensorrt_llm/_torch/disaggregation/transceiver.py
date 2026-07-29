@@ -515,7 +515,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         base_slice = self._create_kv_slice(req)
         all_block_ids = base_slice.block_ids_per_layer_groups
-        tpb = self._reuse_adapter.tokens_per_block
         # Keep the full prompt span for destination projection. Source block
         # lists grow only through the current chunk boundary.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb

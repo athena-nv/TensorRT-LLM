@@ -442,6 +442,31 @@ def test_pipelined_transfer_requires_chunked_prefill():
         )
 
 
+def test_pipelined_transfer_rejects_pipeline_parallelism():
+    """ValueError when pipelined transfer is enabled with pipeline parallelism."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+
+    mapping = MagicMock()
+    mapping.pp_size = 2
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        enable_pipelined_transfer=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="pipeline_parallel_size=1 is required when enable_pipelined_transfer is set.",
+    ):
+        create_kv_cache_transceiver(
+            mapping,
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            cache_transceiver_config,
+            enable_chunked_prefill=True,
+        )
+
+
 def test_pipelined_transfer_requires_gen_first_flow():
     """ValueError when a real request is not using gen-first flow."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
