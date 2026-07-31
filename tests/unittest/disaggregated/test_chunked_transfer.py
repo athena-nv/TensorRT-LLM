@@ -442,10 +442,11 @@ def test_pipelined_transfer_requires_chunked_prefill():
         )
 
 
-def test_pipelined_transfer_rejects_pipeline_parallelism():
-    """ValueError when pipelined transfer is enabled with pipeline parallelism."""
+def test_pipelined_transfer_rejects_pipeline_parallelism(monkeypatch):
+    """ValueError for pipeline parallelism when the disaggregated role is unknown."""
     from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
 
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
     mapping = MagicMock()
     mapping.pp_size = 2
     cache_transceiver_config = CacheTransceiverConfig(
@@ -465,6 +466,36 @@ def test_pipelined_transfer_rejects_pipeline_parallelism():
             cache_transceiver_config,
             enable_chunked_prefill=True,
         )
+
+
+def test_pipelined_transfer_allows_pipeline_parallelism_on_generation_server(monkeypatch):
+    """Pipeline parallelism is allowed when the worker only receives KV cache."""
+    from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    transceiver = MagicMock()
+    transceiver_cls = MagicMock(return_value=transceiver)
+    monkeypatch.setattr(transceiver_module, "KvCacheTransceiverV2", transceiver_cls)
+
+    mapping = MagicMock()
+    mapping.pp_size = 2
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        enable_pipelined_transfer=True,
+    )
+
+    result = create_kv_cache_transceiver(
+        mapping,
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        cache_transceiver_config,
+        enable_chunked_prefill=True,
+    )
+
+    assert result is transceiver
+    transceiver_cls.assert_called_once()
 
 
 def test_pipelined_transfer_requires_gen_first_flow():

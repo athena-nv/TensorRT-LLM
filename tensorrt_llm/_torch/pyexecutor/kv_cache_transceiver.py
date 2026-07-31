@@ -76,10 +76,16 @@ def create_kv_cache_transceiver(
         raise ValueError(
             "enable_chunked_prefill is required when enable_pipelined_transfer is set."
         )
+    is_kv_cache_sender = getenv("TRTLLM_DISAGG_ROLE") != "generation"
     if (cache_transceiver_config.enable_pipelined_transfer
-            and mapping.pp_size != 1):
+            and is_kv_cache_sender and mapping.pp_size != 1):
         raise ValueError(
             "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set."
+        )
+    if (cache_transceiver_config.enable_pipelined_transfer
+            and cache_transceiver_config.kv_cache_bounce_size_mb > 0):
+        raise ValueError(
+            "kv_cache_bounce_size_mb must be 0 when enable_pipelined_transfer is set."
         )
     # Auto-select Python transceiver when enable_pipelined_transfer is set,
     # since the C++ transceiver does not support pipelined transfer.
