@@ -37,6 +37,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <limits>
 #include <map>
 #include <optional>
@@ -4488,6 +4489,27 @@ std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     return getSequence(requestId).getCacheBlockIds(windowSize);
 }
 
+std::vector<std::vector<SizeType32>> BaseKVCacheManager::getCacheBlockIdsRange(
+    LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockBegin, SizeType32 blockEnd) const
+{
+    TLLM_CHECK_WITH_INFO(blockBegin >= 0, "blockBegin must be non-negative");
+    TLLM_CHECK_WITH_INFO(blockEnd >= 0, "blockEnd must be non-negative");
+    TLLM_CHECK_WITH_INFO(blockBegin <= blockEnd, "blockBegin must not exceed blockEnd");
+    auto const& blockIdsPerBeam = getCacheBlockIds(requestId, windowSize);
+    auto const firstResidentBlock = static_cast<size_t>(getSequence(requestId).getNumFrontBlocksRemoved(windowSize));
+    std::vector<std::vector<SizeType32>> result;
+    result.reserve(blockIdsPerBeam.size());
+    for (auto const& blockIds : blockIdsPerBeam)
+    {
+        auto const end = std::min(blockIds.size(), static_cast<size_t>(blockEnd));
+        auto const begin = std::min(end, std::max(firstResidentBlock, static_cast<size_t>(blockBegin)));
+        auto const beginOffset = static_cast<std::ptrdiff_t>(begin);
+        auto const endOffset = static_cast<std::ptrdiff_t>(end);
+        result.emplace_back(blockIds.begin() + beginOffset, blockIds.begin() + endOffset);
+    }
+    return result;
+}
+
 std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     LlmRequest const& llmRequest, SizeType32 windowSize)
 {
@@ -4559,23 +4581,6 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
         hashes.push_back(static_cast<executor::IdType>(block->getHash()));
     }
     return hashes;
-}
-
-std::vector<std::vector<SizeType32>> BaseKVCacheManager::getCacheBlockIdsTail(
-    LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockCount, SizeType32 blockEnd) const
-{
-    TLLM_CHECK_WITH_INFO(blockCount >= 0, "blockCount must be non-negative");
-    TLLM_CHECK_WITH_INFO(blockEnd >= 0, "blockEnd must be non-negative");
-    auto const& blockIdsPerBeam = getCacheBlockIds(requestId, windowSize);
-    std::vector<std::vector<SizeType32>> result;
-    result.reserve(blockIdsPerBeam.size());
-    for (auto const& blockIds : blockIdsPerBeam)
-    {
-        auto const end = std::min(blockIds.size(), static_cast<size_t>(blockEnd));
-        auto const count = std::min(end, static_cast<size_t>(blockCount));
-        result.emplace_back(blockIds.begin() + end - count, blockIds.begin() + end);
-    }
-    return result;
 }
 
 std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheBlockIds(

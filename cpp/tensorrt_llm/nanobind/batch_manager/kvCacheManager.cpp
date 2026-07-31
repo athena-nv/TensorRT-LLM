@@ -630,9 +630,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("request_id"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("get_cache_block_ids_tail", &BaseKVCacheManager::getCacheBlockIdsTail, nb::arg("request_id"),
-            nb::arg("window_size"), nb::arg("block_count"), nb::arg("block_end"),
-            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_cache_block_ids_range", &BaseKVCacheManager::getCacheBlockIdsRange, nb::arg("request_id"),
+            nb::arg("window_size"), nb::arg("block_begin"), nb::arg("block_end"))
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())
         .def("sync_transfer_manager_with_buffer_manager", &BaseKVCacheManager::syncTransferManagerWithBufferManager,

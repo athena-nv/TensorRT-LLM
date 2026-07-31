@@ -546,6 +546,11 @@ class KVCacheManager(BaseResourceManager):
                 f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
 
+        # Cache the finalized post-clamp layer-to-window mapping. Block-ID
+        # queries run on the executor's per-iteration path.
+        self._window_size_by_layer_offset = self._get_layer_offset_to_window_size(
+        )
+
         # Use the provided execution stream for proper synchronization with KVCacheTransferManager.
         # The execution stream is the stream where model forward kernels run, and KVCacheTransferManager
         # needs to synchronize with it for onboard/offload operations.
@@ -1331,6 +1336,15 @@ class KVCacheManager(BaseResourceManager):
         window_size = self._resolve_window_size(window_size)
         return self.impl.get_priority_by_block_id(block_id, window_size)
 
+    def _resolve_cache_window_size(self, layer_idx: Optional[int],
+                                   window_size: Optional[int]) -> int:
+        if window_size is not None or layer_idx is None:
+            return self._resolve_window_size(
+                window_size,
+                "layer_idx or window_size must be provided for VSWA")
+        layer_offset = self.layer_offsets[layer_idx]
+        return self._window_size_by_layer_offset[layer_offset]
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -1340,17 +1354,7 @@ class KVCacheManager(BaseResourceManager):
         num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         beam_width = beam_width or 1
-        if window_size is None:
-            if layer_idx is None:
-                window_size = self._resolve_window_size(
-                    window_size,
-                    "layer_idx or window_size must be provided for VSWA")
-            else:
-                layer_offset = self.layer_offsets[layer_idx]
-                # Explicit layer_offset -> window_size mapping (no modulo
-                # masking length mismatches between pattern and num_local_layers).
-                window_size = self._get_layer_offset_to_window_size(
-                )[layer_offset]
+        window_size = self._resolve_cache_window_size(layer_idx, window_size)
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
@@ -1364,26 +1368,21 @@ class KVCacheManager(BaseResourceManager):
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
 
-    def get_cache_indices_tail(
+    def get_cache_indices_range(
         self,
         request_id: int,
-        block_count: int,
+        block_begin: int,
         block_end: int,
         layer_idx: Optional[int] = None,
+        window_size: Optional[int] = None,
     ) -> List[int]:
-        """Return a bounded tail of cache indices for one request."""
-        if layer_idx is None:
-            window_size = self._resolve_window_size(
-                None, "layer_idx must be provided for VSWA")
-        else:
-            layer_offset = self.layer_offsets[layer_idx]
-            window_size = self._get_layer_offset_to_window_size()[layer_offset]
-
-        per_beam = self.impl.get_cache_block_ids_tail(request_id, window_size,
-                                                      block_count, block_end)
+        """Return resident cache indices in absolute range ``[block_begin, block_end)``."""
+        window_size = self._resolve_cache_window_size(layer_idx, window_size)
+        per_beam = self.impl.get_cache_block_ids_range(request_id, window_size,
+                                                       block_begin, block_end)
         if len(per_beam) != 1:
             raise ValueError(
-                f"Tail cache-index queries require beam_width=1, got {len(per_beam)}"
+                f"Chunked/pipelined KV transfer requires beam_width=1, got {len(per_beam)} beams"
             )
         return list(per_beam[0])
 

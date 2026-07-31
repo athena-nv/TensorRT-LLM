@@ -2116,9 +2116,11 @@ public:
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
         = 0;
 
-    //! \brief Get at most blockCount block ids ending no later than blockEnd, per beam.
-    [[nodiscard]] std::vector<std::vector<SizeType32>> getCacheBlockIdsTail(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockCount, SizeType32 blockEnd) const;
+    //! \brief Get resident block ids in the absolute request block range [blockBegin, blockEnd), per beam.
+    //! \details This non-virtual convenience wrapper excludes front-detached SWA blocks and copies only the requested
+    //! range from the block table returned by getCacheBlockIds.
+    [[nodiscard]] std::vector<std::vector<SizeType32>> getCacheBlockIdsRange(
+        LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockBegin, SizeType32 blockEnd) const;
 
     /// @brief Get the last block id (beam 0) for a given sequence and window size
     [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const

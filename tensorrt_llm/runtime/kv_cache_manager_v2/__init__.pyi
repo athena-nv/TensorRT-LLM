@@ -328,10 +328,10 @@ class _KVCache:
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
         valid_only: bool = False,
     ) -> Iterator[int]: ...
-    def get_aggregated_page_indices_tail(
+    def get_aggregated_page_indices_range(
         self,
         layer_group_id: LayerGroupId,
-        block_count: int,
+        block_begin: int,
         block_end: int,
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
     ) -> Iterator[int]: ...

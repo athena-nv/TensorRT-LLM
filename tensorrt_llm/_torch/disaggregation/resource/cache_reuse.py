@@ -67,15 +67,22 @@ class CacheReuseAdapter(ABC):
         """All block IDs for *req* in layer group *lg* (dtype ``int64``)."""
 
     @abstractmethod
-    def get_block_ids_tail(
+    def get_block_ids_range(
         self,
         req: LlmRequest,
         group_idx: int,
         lg: AttentionLayerGroup,
-        block_count: int,
+        block_begin: int,
         block_end: int,
     ) -> np.ndarray:
-        """A bounded tail of block IDs for a layer group."""
+        """Resident block IDs for absolute request ordinals ``[block_begin, block_end)``.
+
+        The result preserves ordinal order and excludes stale, invalid, and
+        not-yet-allocated entries. It can therefore be shorter than the
+        requested range for sliding-window or sparse-residency layer groups.
+        Empty ranges are valid; negative or reversed bounds are programming
+        errors.
+        """
 
     @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
@@ -115,12 +122,12 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
             dtype=np.int64,
         )
 
-    def get_block_ids_tail(self, req, group_idx, lg, block_count, block_end):  # noqa: ARG002
+    def get_block_ids_range(self, req, group_idx, lg, block_begin, block_end):  # noqa: ARG002
         first_layer = get_global_layer_ids(lg)[0]
         return np.asarray(
-            self._mgr.get_cache_indices_tail(
+            self._mgr.get_cache_indices_range(
                 req.py_request_id,
-                block_count=block_count,
+                block_begin=block_begin,
                 block_end=block_end,
                 layer_idx=first_layer,
             ),
@@ -164,10 +171,10 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
             dtype=np.int64,
         )
 
-    def get_block_ids_tail(self, req, group_idx, lg, block_count, block_end):  # noqa: ARG002
+    def get_block_ids_range(self, req, group_idx, lg, block_begin, block_end):  # noqa: ARG002
         return np.fromiter(
-            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices_tail(
-                group_idx, block_count, block_end
+            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices_range(
+                group_idx, block_begin, block_end
             ),
             dtype=np.int64,
         )

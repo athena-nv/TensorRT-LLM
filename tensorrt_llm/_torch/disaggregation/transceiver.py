@@ -39,6 +39,9 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+_EMPTY_BLOCK_IDS = np.array([], dtype=np.int64)
+_EMPTY_BLOCK_IDS.flags.writeable = False
+
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
@@ -511,7 +514,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         is_last_chunk = req.context_remaining_length == 0
 
         # Keep the full prompt span for destination projection while requesting
-        # only the newly resident tail from each source layer group.
+        # only the current absolute block range from each source layer group.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
         total_blocks = prompt_blocks
 
@@ -519,20 +522,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_end = min(chunk_end_block, total_blocks)
         chunk_block_count = max(0, chunk_end - chunk_start)
         assert self._page_table is not None
-        chunk_block_ids = []
-        for group_idx, layer_group in enumerate(self._page_table.layer_groups):
-            if isinstance(layer_group, MambaLayerGroup):
-                chunk_block_ids.append(np.array([], dtype=np.int64))
-            else:
-                chunk_block_ids.append(
-                    self._reuse_adapter.get_block_ids_tail(
+        layer_groups = self._page_table.layer_groups
+        if chunk_block_count == 0:
+            chunk_block_ids = [_EMPTY_BLOCK_IDS] * len(layer_groups)
+        else:
+            chunk_block_ids = []
+            for group_idx, layer_group in enumerate(layer_groups):
+                if isinstance(layer_group, MambaLayerGroup):
+                    block_ids = _EMPTY_BLOCK_IDS
+                else:
+                    block_ids = self._reuse_adapter.get_block_ids_range(
                         req,
                         group_idx,
                         layer_group,
-                        chunk_block_count,
-                        chunk_end,
+                        block_begin=chunk_start,
+                        block_end=chunk_end,
                     )
-                )
+                    if layer_group.sliding_window_size is None:
+                        assert block_ids.size == chunk_block_count, (
+                            f"chunk [{chunk_start}, {chunk_end}) of layer group {group_idx} "
+                            f"is not fully resident: got {block_ids.size} of "
+                            f"{chunk_block_count} blocks"
+                        )
+                chunk_block_ids.append(block_ids)
         chunk_token_range = None
         if chunk_block_count > 0:
             chunk_token_range = TokenRange(

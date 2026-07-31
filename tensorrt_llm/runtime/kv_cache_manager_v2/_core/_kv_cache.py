@@ -591,19 +591,32 @@ class _KVCache:
             else:
                 yield holder.page.slot_id
 
-    def get_aggregated_page_indices_tail(
+    def get_aggregated_page_indices_range(
         self,
         layer_group_id: LayerGroupId,
-        block_count: int,
+        block_begin: int,
         block_end: int,
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
     ) -> Iterator[int]:
-        """Get a bounded tail of valid aggregated page indices."""
-        if block_count <= 0:
-            return
+        """Get valid aggregated page indices for absolute block ordinals.
+
+        Args:
+            layer_group_id: Layer group to inspect.
+            block_begin: Inclusive request block ordinal.
+            block_end: Exclusive request block ordinal.
+            beam_id: Beam index to read.
+
+        Yields:
+            Resident page indices in ``[block_begin, block_end)``. Invalid or
+            stale entries are omitted, so the result can be shorter than the
+            requested range.
+        """
+        if block_begin < 0 or block_end < 0:
+            raise ValueError("block range bounds must be non-negative")
+        if block_begin > block_end:
+            raise ValueError("block_begin must not exceed block_end")
         end = min(len(self._blocks), block_end)
-        start = max(0, end - block_count)
-        for block in self._blocks[start:end]:
+        for block in self._blocks[block_begin:end]:
             if (holder := block.pages[beam_id][layer_group_id]) is not None:
                 yield holder.page.slot_id
 

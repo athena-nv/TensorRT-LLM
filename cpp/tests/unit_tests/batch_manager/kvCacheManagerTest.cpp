@@ -9232,6 +9232,14 @@ TEST_F(KVCacheManagerTest, VSWABlockStoredDuringGeneration)
     kvCacheManager->addToken(0);
     kvCacheManager->storeNewBlock(*llmRequest0); // no-op (usableSize=11)
 
+    // Absolute range queries must exclude B0: detachFrontBlock leaves its
+    // recycled physical ID in the raw block table at ordinal 0.
+    auto const& rawBlockIds = kvCacheManager->getCacheBlockIds(0, kVSWA_ATTENTION_WINDOW).at(kVSWA_BEAM_IDX);
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, 1).at(kVSWA_BEAM_IDX),
+        ::testing::IsEmpty());
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, 3).at(kVSWA_BEAM_IDX),
+        ::testing::ElementsAre(rawBlockIds.at(1), rawBlockIds.at(2)));
+
     // Generation step 2: token 1012.
     // numTokens becomes 13; usableSize=12, 12%4==0 → storeNewBlock fires.
     // storeNewBlock processes [P0, B1, B2]: P0→node K0 has value B0→advance;

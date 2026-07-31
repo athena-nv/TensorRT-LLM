@@ -30,6 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
 
 # ---------------------------------------------------------------------------
 # _align_kv_blocks: contract unchanged.
@@ -108,6 +109,80 @@ class TestAlignKvBlocks:
 # ---------------------------------------------------------------------------
 
 
+class TestBlockRangeAdapters:
+    def test_v1_adapter_requests_only_block_range(self):
+        mgr = MagicMock()
+        mgr.get_cache_indices_range.return_value = [13, 14, 15]
+        req = SimpleNamespace(py_request_id=1)
+
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids_range(
+            req, 0, _lg(), block_begin=13, block_end=16
+        )
+
+        mgr.get_cache_indices_range.assert_called_once_with(
+            1, block_begin=13, block_end=16, layer_idx=0
+        )
+        np.testing.assert_array_equal(block_ids, [13, 14, 15])
+
+    def test_v2_adapter_requests_only_block_range(self):
+        kv_cache = MagicMock()
+        kv_cache.get_aggregated_page_indices_range.return_value = iter([23, 24])
+        mgr = MagicMock()
+        mgr.kv_cache_map = {1: kv_cache}
+        req = SimpleNamespace(py_request_id=1)
+
+        block_ids = _CacheReuseAdapterV2(mgr).get_block_ids_range(
+            req, 2, _lg(), block_begin=6, block_end=8
+        )
+
+        kv_cache.get_aggregated_page_indices_range.assert_called_once_with(2, 6, 8)
+        np.testing.assert_array_equal(block_ids, [23, 24])
+
+    def test_v2_range_filters_invalid_entries(self):
+        def make_block(slot_id):
+            holder = (
+                None if slot_id is None else SimpleNamespace(page=SimpleNamespace(slot_id=slot_id))
+            )
+            return SimpleNamespace(pages=[[holder]])
+
+        kv_cache = SimpleNamespace(
+            _blocks=[make_block(10), make_block(None), make_block(12), make_block(13)]
+        )
+
+        result = list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, 0, 4))
+
+        assert result == [10, 12, 13]
+
+    @pytest.mark.parametrize("block_begin,block_end", [(-1, 1), (0, -1), (2, 1)])
+    def test_v2_range_rejects_invalid_bounds(self, block_begin, block_end):
+        kv_cache = SimpleNamespace(_blocks=[])
+
+        with pytest.raises(ValueError):
+            list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, block_begin, block_end))
+
+    def test_v1_manager_resolves_layer_window_once_and_forwards_range(self):
+        manager = object.__new__(KVCacheManager)
+        manager.layer_offsets = [7]
+        manager._window_size_by_layer_offset = {7: 128}
+        manager.impl = MagicMock()
+        manager.impl.get_cache_block_ids_range.return_value = [[20, 21]]
+
+        result = manager.get_cache_indices_range(1, 4, 6, layer_idx=0)
+
+        assert result == [20, 21]
+        manager.impl.get_cache_block_ids_range.assert_called_once_with(1, 128, 4, 6)
+
+    def test_v1_manager_rejects_multiple_beams(self):
+        manager = object.__new__(KVCacheManager)
+        manager.layer_offsets = [0]
+        manager._window_size_by_layer_offset = {0: 128}
+        manager.impl = MagicMock()
+        manager.impl.get_cache_block_ids_range.return_value = [[20], [21]]
+
+        with pytest.raises(ValueError, match="Chunked/pipelined KV transfer requires beam_width=1"):
+            manager.get_cache_indices_range(1, 0, 1, layer_idx=0)
+
+
 class TestPackedBeamBlockLayout:
     """Verify beam search block IDs stay 1-D with only final tail blocks appended."""
 
@@ -133,34 +208,6 @@ class TestPackedBeamBlockLayout:
 
         assert mgr.beam_width == 4
         np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
-
-    def test_v1_adapter_requests_only_block_tail(self):
-        mgr = MagicMock()
-        mgr.get_cache_indices_tail.return_value = [13, 14, 15]
-        req = SimpleNamespace(py_request_id=1)
-
-        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids_tail(
-            req, 0, _lg(), block_count=3, block_end=16
-        )
-
-        mgr.get_cache_indices_tail.assert_called_once_with(
-            1, block_count=3, block_end=16, layer_idx=0
-        )
-        np.testing.assert_array_equal(block_ids, [13, 14, 15])
-
-    def test_v2_adapter_requests_only_block_tail(self):
-        kv_cache = MagicMock()
-        kv_cache.get_aggregated_page_indices_tail.return_value = iter([23, 24])
-        mgr = MagicMock()
-        mgr.kv_cache_map = {1: kv_cache}
-        req = SimpleNamespace(py_request_id=1)
-
-        block_ids = _CacheReuseAdapterV2(mgr).get_block_ids_tail(
-            req, 2, _lg(), block_count=2, block_end=8
-        )
-
-        kv_cache.get_aggregated_page_indices_tail.assert_called_once_with(2, 2, 8)
-        np.testing.assert_array_equal(block_ids, [23, 24])
 
     def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):
         packed = KVCacheManager._pack_beam_cache_indices([[10], [10], [10], [10]])
@@ -399,7 +446,7 @@ class _StubAdapter(CacheReuseAdapter):
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
-    def get_block_ids_tail(self, req, group_idx, lg, block_count, block_end):  # noqa: ARG002
+    def get_block_ids_range(self, req, group_idx, lg, block_begin, block_end):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
     def commit_blocks_for_reuse(self, req):  # noqa: ARG002
