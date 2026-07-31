@@ -180,19 +180,29 @@ def _send_prefill_chunks(
     """
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
-    base_slice = KVSlice(
-        block_ids_per_layer_groups=all_block_ids,
-        mamba_state_index=mamba_state_index,
-    )
     session = sender_session if sender_session is not None else MagicMock()
     session.kv_tasks = []
     transceiver = MagicMock()
     transceiver._get_or_create_send_session.return_value = session
-    transceiver._create_kv_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [MagicMock() for _ in all_block_ids]
+    transceiver._get_mamba_state_index.return_value = mamba_state_index
+
+    def get_block_ids_tail(req, group_idx, _layer_group, _block_count, _block_end):
+        block_ids = all_block_ids[group_idx]
+        chunk_start = req.py_last_context_chunk[0] // tokens_per_block
+        chunk_end = req.py_last_context_chunk[1] // tokens_per_block
+        resident_start = max(0, chunk_end - len(block_ids))
+        overlap_start = max(chunk_start, resident_start)
+        if overlap_start >= chunk_end:
+            return block_ids[:0]
+        local_start = overlap_start - resident_start
+        return block_ids[local_start : local_start + chunk_end - overlap_start]
+
+    transceiver._reuse_adapter.get_block_ids_tail.side_effect = get_block_ids_tail
 
     prompt_len = total_blocks * tokens_per_block
     req = MagicMock()
@@ -241,6 +251,8 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [MagicMock()]
+    transceiver._get_mamba_state_index.return_value = None
 
     req = MagicMock()
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
@@ -252,9 +264,7 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
         chunk_start = chunk_idx * chunk_blocks
         chunk_end = chunk_start + chunk_blocks
         resident_ids = np.arange(chunk_end, dtype=np.int64)
-        transceiver._create_kv_slice.return_value = KVSlice(
-            block_ids_per_layer_groups=[resident_ids]
-        )
+        transceiver._reuse_adapter.get_block_ids_tail.return_value = resident_ids[-chunk_blocks:]
         req.py_last_context_chunk = (
             chunk_start * tokens_per_block,
             chunk_end * tokens_per_block,
@@ -268,6 +278,13 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
             np.arange(chunk_start, chunk_end, dtype=np.int64),
         )
         assert kv_slice.total_blocks == prompt_blocks
+
+    transceiver._create_kv_slice.assert_not_called()
+    assert transceiver._reuse_adapter.get_block_ids_tail.call_count == 2
+    assert all(
+        call.args[3] == chunk_blocks and call.args[4] == (idx + 1) * chunk_blocks
+        for idx, call in enumerate(transceiver._reuse_adapter.get_block_ids_tail.call_args_list)
+    )
 
 
 @pytest.mark.parametrize(

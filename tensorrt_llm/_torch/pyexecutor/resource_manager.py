@@ -1364,6 +1364,29 @@ class KVCacheManager(BaseResourceManager):
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
 
+    def get_cache_indices_tail(
+        self,
+        request_id: int,
+        block_count: int,
+        block_end: int,
+        layer_idx: Optional[int] = None,
+    ) -> List[int]:
+        """Return a bounded tail of cache indices for one request."""
+        if layer_idx is None:
+            window_size = self._resolve_window_size(
+                None, "layer_idx must be provided for VSWA")
+        else:
+            layer_offset = self.layer_offsets[layer_idx]
+            window_size = self._get_layer_offset_to_window_size()[layer_offset]
+
+        per_beam = self.impl.get_cache_block_ids_tail(request_id, window_size,
+                                                      block_count, block_end)
+        if len(per_beam) != 1:
+            raise ValueError(
+                f"Tail cache-index queries require beam_width=1, got {len(per_beam)}"
+            )
+        return list(per_beam[0])
+
     def get_batch_cache_indices_flat(
         self,
         request_ids: List[int],

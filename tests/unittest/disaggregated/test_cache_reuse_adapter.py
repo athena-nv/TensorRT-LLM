@@ -25,6 +25,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV1,
+    _CacheReuseAdapterV2,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -132,6 +133,34 @@ class TestPackedBeamBlockLayout:
 
         assert mgr.beam_width == 4
         np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
+
+    def test_v1_adapter_requests_only_block_tail(self):
+        mgr = MagicMock()
+        mgr.get_cache_indices_tail.return_value = [13, 14, 15]
+        req = SimpleNamespace(py_request_id=1)
+
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids_tail(
+            req, 0, _lg(), block_count=3, block_end=16
+        )
+
+        mgr.get_cache_indices_tail.assert_called_once_with(
+            1, block_count=3, block_end=16, layer_idx=0
+        )
+        np.testing.assert_array_equal(block_ids, [13, 14, 15])
+
+    def test_v2_adapter_requests_only_block_tail(self):
+        kv_cache = MagicMock()
+        kv_cache.get_aggregated_page_indices_tail.return_value = iter([23, 24])
+        mgr = MagicMock()
+        mgr.kv_cache_map = {1: kv_cache}
+        req = SimpleNamespace(py_request_id=1)
+
+        block_ids = _CacheReuseAdapterV2(mgr).get_block_ids_tail(
+            req, 2, _lg(), block_count=2, block_end=8
+        )
+
+        kv_cache.get_aggregated_page_indices_tail.assert_called_once_with(2, 2, 8)
+        np.testing.assert_array_equal(block_ids, [23, 24])
 
     def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):
         packed = KVCacheManager._pack_beam_cache_indices([[10], [10], [10], [10]])
@@ -368,6 +397,9 @@ class _StubAdapter(CacheReuseAdapter):
         return self._scalar
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+        return np.array([], dtype=np.int64)
+
+    def get_block_ids_tail(self, req, group_idx, lg, block_count, block_end):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
     def commit_blocks_for_reuse(self, req):  # noqa: ARG002

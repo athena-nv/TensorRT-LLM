@@ -4561,6 +4561,23 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     return hashes;
 }
 
+std::vector<std::vector<SizeType32>> BaseKVCacheManager::getCacheBlockIdsTail(
+    LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockCount, SizeType32 blockEnd) const
+{
+    TLLM_CHECK_WITH_INFO(blockCount >= 0, "blockCount must be non-negative");
+    TLLM_CHECK_WITH_INFO(blockEnd >= 0, "blockEnd must be non-negative");
+    auto const& blockIdsPerBeam = getCacheBlockIds(requestId, windowSize);
+    std::vector<std::vector<SizeType32>> result;
+    result.reserve(blockIdsPerBeam.size());
+    for (auto const& blockIds : blockIdsPerBeam)
+    {
+        auto const end = std::min(blockIds.size(), static_cast<size_t>(blockEnd));
+        auto const count = std::min(end, static_cast<size_t>(blockCount));
+        result.emplace_back(blockIds.begin() + end - count, blockIds.begin() + end);
+    }
+    return result;
+}
+
 std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheBlockIds(
     std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
 {

@@ -16,7 +16,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
     get_unique_rid,
-    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
@@ -229,16 +228,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
             groups.append(block_ids)
 
-        mamba_state_index = None
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
-
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
-            mamba_state_index=mamba_state_index,
+            mamba_state_index=self._get_mamba_state_index(req),
             token_range=token_range,
         )
+
+    def _get_mamba_state_index(self, req: LlmRequest) -> Optional[int]:
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
+        return None
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
         """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
@@ -510,25 +510,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
         is_last_chunk = req.context_remaining_length == 0
 
-        base_slice = self._create_kv_slice(req)
-        all_block_ids = base_slice.block_ids_per_layer_groups
-        # Keep the full prompt span for destination projection. Source block
-        # lists grow only through the current chunk boundary.
+        # Keep the full prompt span for destination projection while requesting
+        # only the newly resident tail from each source layer group.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
         total_blocks = prompt_blocks
 
         chunk_start = min(chunk_start_block, total_blocks)
         chunk_end = min(chunk_end_block, total_blocks)
         chunk_block_count = max(0, chunk_end - chunk_start)
-        chunk_block_ids = [
-            project_blocks_to_global_chunk(
-                block_ids,
-                chunk_block_offset=chunk_start,
-                chunk_block_count=chunk_block_count,
-                resident_block_end=chunk_end,
-            )
-            for block_ids in all_block_ids
-        ]
+        assert self._page_table is not None
+        chunk_block_ids = []
+        for group_idx, layer_group in enumerate(self._page_table.layer_groups):
+            if isinstance(layer_group, MambaLayerGroup):
+                chunk_block_ids.append(np.array([], dtype=np.int64))
+            else:
+                chunk_block_ids.append(
+                    self._reuse_adapter.get_block_ids_tail(
+                        req,
+                        group_idx,
+                        layer_group,
+                        chunk_block_count,
+                        chunk_end,
+                    )
+                )
         chunk_token_range = None
         if chunk_block_count > 0:
             chunk_token_range = TokenRange(
@@ -539,7 +543,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return KVSlice(
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
-            mamba_state_index=base_slice.mamba_state_index,
+            mamba_state_index=self._get_mamba_state_index(req),
             token_range=chunk_token_range,
             total_blocks=total_blocks,
         )

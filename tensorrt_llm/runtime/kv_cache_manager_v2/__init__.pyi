@@ -328,6 +328,13 @@ class _KVCache:
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
         valid_only: bool = False,
     ) -> Iterator[int]: ...
+    def get_aggregated_page_indices_tail(
+        self,
+        layer_group_id: LayerGroupId,
+        block_count: int,
+        block_end: int,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+    ) -> Iterator[int]: ...
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
     @property
     def capacity(self) -> int: ...

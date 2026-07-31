@@ -67,6 +67,17 @@ class CacheReuseAdapter(ABC):
         """All block IDs for *req* in layer group *lg* (dtype ``int64``)."""
 
     @abstractmethod
+    def get_block_ids_tail(
+        self,
+        req: LlmRequest,
+        group_idx: int,
+        lg: AttentionLayerGroup,
+        block_count: int,
+        block_end: int,
+    ) -> np.ndarray:
+        """A bounded tail of block IDs for a layer group."""
+
+    @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit KV blocks to radix tree for future prefix reuse.
 
@@ -104,6 +115,18 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
             dtype=np.int64,
         )
 
+    def get_block_ids_tail(self, req, group_idx, lg, block_count, block_end):  # noqa: ARG002
+        first_layer = get_global_layer_ids(lg)[0]
+        return np.asarray(
+            self._mgr.get_cache_indices_tail(
+                req.py_request_id,
+                block_count=block_count,
+                block_end=block_end,
+                layer_idx=first_layer,
+            ),
+            dtype=np.int64,
+        )
+
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
             return
@@ -137,6 +160,14 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
+            ),
+            dtype=np.int64,
+        )
+
+    def get_block_ids_tail(self, req, group_idx, lg, block_count, block_end):  # noqa: ARG002
+        return np.fromiter(
+            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices_tail(
+                group_idx, block_count, block_end
             ),
             dtype=np.int64,
         )

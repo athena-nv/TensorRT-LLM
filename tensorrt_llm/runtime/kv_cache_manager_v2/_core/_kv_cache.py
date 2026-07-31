@@ -591,6 +591,22 @@ class _KVCache:
             else:
                 yield holder.page.slot_id
 
+    def get_aggregated_page_indices_tail(
+        self,
+        layer_group_id: LayerGroupId,
+        block_count: int,
+        block_end: int,
+        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
+    ) -> Iterator[int]:
+        """Get a bounded tail of valid aggregated page indices."""
+        if block_count <= 0:
+            return
+        end = min(len(self._blocks), block_end)
+        start = max(0, end - block_count)
+        for block in self._blocks[start:end]:
+            if (holder := block.pages[beam_id][layer_group_id]) is not None:
+                yield holder.page.slot_id
+
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> "ScratchDesc | None":
         """
         Get scratch metadata for the given layer group, or None if scratch is not active.
