@@ -33,6 +33,8 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    _KV_RESULT_PREFIX,
+    NO_SLICE_ID,
     AgentResult,
     KVSendTask,
     RecvReqInfo,
@@ -40,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Sender,
     TaskStatus,
     TxSession,
+    WriteMeta,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -172,8 +175,8 @@ def test_chunk_projection_maps_prefix_reuse_suffix_by_overlap():
     assert np.array_equal(second_chunk, block_ids)
 
 
-def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
-    """A short layer group's suffix blocks transfer with the overlapping global chunk."""
+def _make_projection_sender() -> Sender:
+    """Create a Sender wired to a stub registrar with two non-windowed layer groups."""
     peer_ri = SimpleNamespace(
         dp_rank=0,
         device_id=0,
@@ -218,8 +221,11 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
 
     sender = Sender.__new__(Sender)
     sender._registrar = registrar
+    return sender
 
-    task = KVSendTask(
+
+def _make_projection_task(slice_id: int = 1) -> KVSendTask:
+    return KVSendTask(
         KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=[
@@ -230,10 +236,13 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
             total_blocks=8,
         ),
         _make_params(),
-        slice_id=1,
+        slice_id=slice_id,
         prompt_len=64,
     )
-    req_info = RecvReqInfo(
+
+
+def _make_projection_req_info(slice_id=None) -> RecvReqInfo:
+    return RecvReqInfo(
         sender_req_id=42,
         instance_name="decode",
         instance_rank=0,
@@ -242,9 +251,15 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
             np.array([200, 201, 202], dtype=np.int64),
         ],
         unique_rid=42,
+        slice_id=slice_id,
     )
 
-    write_meta = sender._build_kv_write_meta(task, req_info)
+
+def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
+    """A short layer group's suffix blocks transfer with the overlapping global chunk."""
+    sender = _make_projection_sender()
+
+    write_meta = sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
 
     assert np.array_equal(
         write_meta.src_ptrs,
@@ -255,6 +270,131 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
         np.array([104, 105, 106, 107, 200, 201, 202], dtype=np.int64),
     )
     assert np.array_equal(write_meta.sizes, np.ones(7, dtype=np.int64))
+    # The sender's chunk index and the peer's task index are tracked separately;
+    # a receiver that sends no slice_id is addressed as its single task 0.
+    assert write_meta.sender_slice_id == 1
+    assert write_meta.receiver_slice_id == 0
+
+
+def test_build_kv_write_meta_echoes_receiver_slice_id():
+    """receiver_slice_id comes from the peer's RecvReqInfo, not the sender's chunk index."""
+    sender = _make_projection_sender()
+
+    write_meta = sender._build_kv_write_meta(
+        _make_projection_task(slice_id=1), _make_projection_req_info(slice_id=3)
+    )
+
+    assert write_meta.sender_slice_id == 1
+    assert write_meta.receiver_slice_id == 3
+
+
+# ---------------------------------------------------------------------------
+# KV_AGENT_RESULT slice-id addressing tests
+# ---------------------------------------------------------------------------
+
+
+def _make_write_meta(sender_slice_id, receiver_slice_id) -> WriteMeta:
+    empty = np.array([], dtype=np.int64)
+    return WriteMeta(
+        task=MagicMock(),
+        expected_transfers=1,
+        peer_name="decode0",
+        peer_rank=0,
+        peer_endpoint="tcp://decode:0",
+        unique_rid=42,
+        src_ptrs=empty,
+        dst_ptrs=empty,
+        sizes=empty,
+        sender_slice_id=sender_slice_id,
+        receiver_slice_id=receiver_slice_id,
+    )
+
+
+def test_send_kv_result_carries_both_slice_ids():
+    """The result frame reports the sender's chunk and addresses the peer's own task."""
+    sender = Sender.__new__(Sender)
+    sender._instance_rank = 5
+    dealer = MagicMock()
+    sender._get_or_connect_thread_dealer = MagicMock(return_value=dealer)
+
+    sender._send_kv_result_to_receiver(
+        _make_write_meta(sender_slice_id=4, receiver_slice_id=2),
+        is_last=True,
+        result=AgentResult.SUCCESS,
+    )
+
+    (msg,), _ = dealer.send.call_args
+    rank, rid, sender_slice_id, receiver_slice_id, is_last, _code = _KV_RESULT_PREFIX.unpack(msg[1])
+    assert (rank, rid, sender_slice_id, receiver_slice_id, is_last) == (5, 42, 4, 2, True)
+
+
+def test_send_kv_result_without_task_reports_no_slice_id():
+    """A result with no owning KVSendTask reports NO_SLICE_ID rather than chunk 0."""
+    sender = Sender.__new__(Sender)
+    sender._instance_rank = 5
+    dealer = MagicMock()
+    sender._get_or_connect_thread_dealer = MagicMock(return_value=dealer)
+
+    sender._send_kv_result_to_receiver(
+        _make_write_meta(sender_slice_id=None, receiver_slice_id=0),
+        is_last=True,
+        result=AgentResult.FAILED,
+    )
+
+    (msg,), _ = dealer.send.call_args
+    _rank, _rid, sender_slice_id, _receiver_slice_id, _is_last, _code = _KV_RESULT_PREFIX.unpack(
+        msg[1]
+    )
+    assert sender_slice_id == NO_SLICE_ID
+
+
+def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
+    """A sender chunk id far past the receiver's task count still resolves task 0."""
+    session = _make_rx_session(1)
+    session._kv_tasks[0].expected_transfers = 1
+    session._receiver._bounce.is_bounced.return_value = False
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        receiver_slice_id=0,
+        sender_slice_id=4,
+        is_last_slice=True,
+        status=AgentResult.SUCCESS,
+    )
+
+    assert session._kv_tasks[0].status == TaskStatus.TRANSFERRED
+
+
+def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
+    """Indexing is bounded by the receiver's own task count, and names both ids."""
+    session = _make_rx_session(1)
+
+    with pytest.raises(AssertionError, match=r"receiver_slice_id=2.*sender_slice_id=0"):
+        session.process_kv_agent_result(
+            peer_rank=0,
+            receiver_slice_id=2,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+        )
+
+
+def test_process_kv_agent_result_failure_attributes_sender_chunk():
+    """A failed chunk names the sender chunk so the failure is attributable."""
+    session = _make_rx_session(1)
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        receiver_slice_id=0,
+        sender_slice_id=3,
+        is_last_slice=False,
+        status=AgentResult.FAILED,
+    )
+
+    task = session._kv_tasks[0]
+    assert task.status == TaskStatus.ERROR
+    assert "sender_slice_id=3" in str(task._exception)
+    assert session.status == SessionStatus.ERROR
 
 
 # ---------------------------------------------------------------------------
