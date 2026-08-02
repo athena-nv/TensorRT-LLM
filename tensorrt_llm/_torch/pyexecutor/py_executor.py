@@ -4754,7 +4754,7 @@ class PyExecutor:
                 )
 
             disagg_params = request.py_disaggregated_params
-            if (disagg_params is None or disagg_params.schedule_style
+            if (disagg_params is not None and disagg_params.schedule_style
                     != DisaggScheduleStyle.GENERATION_FIRST):
                 raise ValueError("schedule_style must be generation_first when "
                                  "enable_pipelined_transfer is set.")

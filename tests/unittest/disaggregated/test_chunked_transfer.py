@@ -547,6 +547,27 @@ def test_pipelined_transfer_requires_gen_first_flow():
         PyExecutor._validate_request(executor, request)
 
 
+def test_pipelined_transfer_allows_non_disaggregated_request():
+    """Requests without disaggregated parameters do not transfer KV cache."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.is_warmup = False
+    executor.max_beam_width = 1
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+    executor._validate_token_id_range = MagicMock()
+    executor.sampler.validate_request = MagicMock()
+
+    request = MagicMock()
+    request.sampling_config = None
+    request.py_beam_width = 1
+    request.py_disaggregated_params = None
+
+    PyExecutor._validate_request(executor, request)
+
+    executor.sampler.validate_request.assert_called_once_with(request)
+
+
 def test_pipelined_last_chunk_sends_and_finalizes():
     """respond_and_send_async sends the built chunk and finalizes on the last chunk."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
