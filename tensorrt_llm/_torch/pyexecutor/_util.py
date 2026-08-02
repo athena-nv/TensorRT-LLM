@@ -123,42 +123,45 @@ def get_kv_cache_manager_cls(
 
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
+        mixed_manager_source = None
         if use_py_mamba_cache_manager():
-            if kv_cache_config.enable_block_reuse:
-                raise ValueError(
-                    "TRTLLM_USE_PY_MAMBA=1 forces "
-                    "MixedMambaHybridCacheManager, which does not support "
-                    "block reuse. Disable block reuse or unset "
-                    "TRTLLM_USE_PY_MAMBA to use CppMambaHybridCacheManager.")
-            logger.info(
-                "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
-        if kv_cache_config.enable_block_reuse:
-            return CppMambaHybridCacheManager
-        if (cache_transceiver_config is not None
-                and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-            logger.info("Python transceiver detected; using "
-                        "MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
-        default_cls = CppMambaHybridCacheManager
-        env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
-        if env_override is not None:
-            if env_override.upper() == 'MIXED':
+            mixed_manager_source = "TRTLLM_USE_PY_MAMBA=1"
+        elif (cache_transceiver_config is not None
+              and cache_transceiver_config.transceiver_runtime == "PYTHON"):
+            mixed_manager_source = "transceiver_runtime='PYTHON'"
+        else:
+            env_override = os.environ.get(
+                'TLLM_MAMBA_MANAGER_PREFERENCE')
+            if env_override is not None and env_override.upper() == 'MIXED':
                 logger.warning(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED overrides the default Mamba cache manager to MixedMambaHybridCacheManager. This may lead to increased memory usage due to lack of block reuse, but can be necessary for disaggregated setups or to avoid potential issues with the C++ manager. Set TLLM_MAMBA_MANAGER_PREFERENCE=CPP to use the CppMambaHybridCacheManager instead, which is the default for non-disaggregated setups without block reuse explicitly disabled."
                 )
-                return MixedMambaHybridCacheManager
-            elif env_override.upper() == 'CPP':
+                mixed_manager_source = "TLLM_MAMBA_MANAGER_PREFERENCE=MIXED"
+            elif env_override is not None and env_override.upper() == 'CPP':
                 logger.warning(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP overrides the default Mamba cache manager to CppMambaHybridCacheManager. This enables block reuse and can reduce memory usage, but may not be compatible with disaggregated setups. Set TLLM_MAMBA_MANAGER_PREFERENCE=MIXED to use the MixedMambaHybridCacheManager instead if you encounter issues with the C++ manager or are running in a disaggregated environment."
                 )
                 return CppMambaHybridCacheManager
-            else:
+            elif env_override is not None:
                 logger.warning(
                     f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
-                    f"Expected 'CPP' or 'MIXED'. Using default {default_cls.__name__}."
+                    "Expected 'CPP' or 'MIXED'. Using default "
+                    "CppMambaHybridCacheManager."
                 )
-        return default_cls
+
+        if mixed_manager_source is not None:
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    f"{mixed_manager_source} selects "
+                    "MixedMambaHybridCacheManager, which does not support "
+                    "block reuse. Set KvCacheConfig.enable_block_reuse=False "
+                    "or select CppMambaHybridCacheManager.")
+            logger.info(
+                f"{mixed_manager_source} selects "
+                "MixedMambaHybridCacheManager for hybrid mamba model")
+            return MixedMambaHybridCacheManager
+
+        return CppMambaHybridCacheManager
     elif sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     else:

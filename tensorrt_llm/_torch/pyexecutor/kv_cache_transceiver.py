@@ -11,13 +11,74 @@ from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager)
+                                  CppMambaHybridCacheManager,
+                                  MambaHybridCacheManager,
+                                  MixedMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
+
+
+def resolve_cache_transceiver_config(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> None:
+    """Resolve defaults and validate runtime-independent configuration."""
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        return
+
+    if cache_transceiver_config.backend == "DEFAULT":
+        # NIXL is the default backend. Legacy environment variables override it
+        # in priority order.
+        cache_transceiver_config.backend = "NIXL"
+        backend_env_vars = [
+            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+        ]
+        for env_var, backend in backend_env_vars:
+            if getenv(env_var) == "1":
+                logger.warning(
+                    f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
+                )
+                cache_transceiver_config.backend = backend
+                break
+
+    runtime = cache_transceiver_config.transceiver_runtime
+    enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
+    if runtime is None and enable_pipelined_transfer:
+        if cache_transceiver_config.backend != "NIXL":
+            raise ValueError(
+                f"enable_pipelined_transfer is set but backend "
+                f"'{cache_transceiver_config.backend}' requires the C++ "
+                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
+                f"enable pipelined transfer.")
+        logger.warning(
+            "enable_pipelined_transfer is set; auto-selecting the Python "
+            "transceiver instead of the C++ transceiver to enable "
+            "pipelined KV cache transfer. "
+            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+        cache_transceiver_config.transceiver_runtime = "PYTHON"
+    elif runtime == "CPP" and enable_pipelined_transfer:
+        raise ValueError(
+            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
+        )
+
+    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and cache_transceiver_config.backend != "NIXL"):
+        raise ValueError(
+            f"Python transceiver currently only supports NIXL backend, "
+            f"got {cache_transceiver_config.backend}. "
+            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+        )
+    if (enable_pipelined_transfer
+            and cache_transceiver_config.kv_cache_bounce_size_mb > 0):
+        raise ValueError(
+            "kv_cache_bounce_size_mb must be 0 when enable_pipelined_transfer is set."
+        )
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -39,28 +100,10 @@ def create_kv_cache_transceiver(
         cache_transceiver_config: CacheTransceiverConfig,
         mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
         enable_chunked_prefill: bool = False):
+    resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
-
-    if cache_transceiver_config.backend == "DEFAULT":
-        # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # NIXL is the default backend for non hybrid models
-        cache_transceiver_config.backend = "NIXL"
-        # Ordered by priority
-        env_vars = [
-            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
-            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
-        ]
-        for env_var, be_type in env_vars:
-            if getenv(env_var) == "1":
-                logger.warning(
-                    f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
-                )
-                cache_transceiver_config.backend = be_type
-                break
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
@@ -82,52 +125,21 @@ def create_kv_cache_transceiver(
         raise ValueError(
             "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set."
         )
-    if (cache_transceiver_config.enable_pipelined_transfer
-            and cache_transceiver_config.kv_cache_bounce_size_mb > 0):
-        raise ValueError(
-            "kv_cache_bounce_size_mb must be 0 when enable_pipelined_transfer is set."
-        )
-    # Auto-select Python transceiver when enable_pipelined_transfer is set,
-    # since the C++ transceiver does not support pipelined transfer.
-    # Only applies to NIXL/DEFAULT backends (the Python transceiver
-    # does not support UCX, MPI, or MOONCAKE).
-    runtime = cache_transceiver_config.transceiver_runtime
-    use_python = runtime == "PYTHON"
-    if (runtime is None and cache_transceiver_config.enable_pipelined_transfer):
-        if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
-            logger.warning(
-                "enable_pipelined_transfer is set; auto-selecting the Python "
-                "transceiver instead of the C++ transceiver to enable "
-                "pipelined KV cache transfer. "
-                "Set transceiver_runtime='CPP' to disable this auto-selection.")
-            use_python = True
-        else:
-            raise ValueError(
-                f"enable_pipelined_transfer is set but backend "
-                f"'{cache_transceiver_config.backend}' requires the C++ "
-                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
-                f"enable pipelined transfer.")
-    elif (runtime == "CPP"
-          and cache_transceiver_config.enable_pipelined_transfer):
-        raise ValueError(
-            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
-            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
-        )
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if use_python:
-        # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in (None, "DEFAULT", "NIXL"):
+    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+        if (isinstance(kv_cache_manager, MambaHybridCacheManager)
+                and not isinstance(kv_cache_manager,
+                                   MixedMambaHybridCacheManager)):
             raise ValueError(
-                f"Python transceiver currently only supports NIXL or DEFAULT backend, "
-                f"got {cache_transceiver_config.backend}. "
-                f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-            )
+                "Python transceiver requires MixedMambaHybridCacheManager "
+                f"for hybrid models, got {type(kv_cache_manager).__name__}.")
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
+        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 

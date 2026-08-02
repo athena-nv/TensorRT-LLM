@@ -20,10 +20,44 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@pytest.mark.parametrize("manager_source", ["PYTHON", "MIXED"])
+def test_mixed_mamba_manager_rejects_block_reuse(monkeypatch, manager_source):
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    monkeypatch.setattr(_util, "is_hybrid_linear", lambda _: True)
+    monkeypatch.setattr(_util, "use_py_mamba_cache_manager", lambda: False)
+    if manager_source == "MIXED":
+        monkeypatch.setenv("TLLM_MAMBA_MANAGER_PREFERENCE", "MIXED")
+        cache_transceiver_config = None
+    else:
+        monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+        cache_transceiver_config = CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+        )
+
+    model_config = SimpleNamespace(
+        pretrained_config=object(),
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Set KvCacheConfig\.enable_block_reuse=False",
+    ):
+        _util.get_kv_cache_manager_cls(
+            model_config,
+            kv_cache_config,
+            cache_transceiver_config=cache_transceiver_config,
+        )
 
 
 def _make_mgr(

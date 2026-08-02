@@ -495,7 +495,32 @@ def test_pipelined_transfer_allows_pipeline_parallelism_on_generation_server(mon
     )
 
     assert result is transceiver
+    assert cache_transceiver_config.transceiver_runtime == "PYTHON"
     transceiver_cls.assert_called_once()
+
+
+def test_python_transceiver_rejects_cpp_mamba_cache_manager():
+    """Python transceiver requires separate Python-managed Mamba state."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+
+    kv_cache_manager = object.__new__(CppMambaHybridCacheManager)
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        transceiver_runtime="PYTHON",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Python transceiver requires MixedMambaHybridCacheManager",
+    ):
+        create_kv_cache_transceiver(
+            MagicMock(),
+            MagicMock(),
+            kv_cache_manager,
+            MagicMock(),
+            cache_transceiver_config,
+        )
 
 
 def test_pipelined_transfer_requires_gen_first_flow():
