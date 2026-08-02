@@ -546,8 +546,10 @@ class KVCacheManager(BaseResourceManager):
                 f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
 
-        # Cache the finalized post-clamp layer-to-window mapping. Block-ID
-        # queries run on the executor's per-iteration path.
+        # Cache the layer-to-window mapping now that window clamping is done:
+        # block-ID queries run on the executor's per-iteration path and must not
+        # rebuild it.  Note this is derived from max_attention_window_vec, which
+        # the non-SELF branch above leaves at its pre-rewrite value.
         self._window_size_by_layer_offset = self._get_layer_offset_to_window_size(
         )
 
@@ -1376,7 +1378,18 @@ class KVCacheManager(BaseResourceManager):
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
     ) -> List[int]:
-        """Return resident cache indices in absolute range ``[block_begin, block_end)``."""
+        """Return resident cache indices in absolute range ``[block_begin, block_end)``.
+
+        The result is the contiguous run of resident blocks ending at
+        ``block_end``; front-detached SWA blocks are excluded.  See
+        ``BaseKVCacheManager::getCacheBlockIdsRange`` for the full contract.
+        """
+        # Mirror KVCacheManagerV2, which raises ValueError for these, so both
+        # backends of CacheReuseAdapter.get_block_ids_range agree.
+        if block_begin < 0 or block_end < 0:
+            raise ValueError("block range bounds must be non-negative")
+        if block_begin > block_end:
+            raise ValueError("block_begin must not exceed block_end")
         window_size = self._resolve_cache_window_size(layer_idx, window_size)
         per_beam = self.impl.get_cache_block_ids_range(request_id, window_size,
                                                        block_begin, block_end)

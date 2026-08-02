@@ -189,10 +189,16 @@ def _send_prefill_chunks(
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._send_reqs = {}
+    # A layer group holding fewer blocks than the prompt is a sliding-window
+    # group whose leading blocks have been evicted, so its IDs are the resident
+    # *suffix* [total_blocks - len(ids), total_blocks) of the block table.
+    resident_begins = [total_blocks - len(block_ids) for block_ids in all_block_ids]
     transceiver._page_table.layer_groups = [
         AttentionLayerGroup(
             pool_group_idx=group_idx,
-            sliding_window_size=1 if len(block_ids) < total_blocks else None,
+            sliding_window_size=(
+                len(block_ids) * tokens_per_block if len(block_ids) < total_blocks else None
+            ),
         )
         for group_idx, block_ids in enumerate(all_block_ids)
     ]
@@ -203,10 +209,14 @@ def _send_prefill_chunks(
     transceiver._get_mamba_state_index.return_value = mamba_state_index
 
     def get_block_ids_range(_req, group_idx, _layer_group, block_begin, block_end):
+        """Contiguous resident run ending at ``block_end`` — the adapter contract."""
         block_ids = all_block_ids[group_idx]
-        end = min(len(block_ids), block_end)
-        begin = min(end, block_begin)
-        return block_ids[begin:end]
+        resident_begin = resident_begins[group_idx]
+        assert block_end <= total_blocks, "callers must not read past the allocated blocks"
+        begin = max(block_begin, resident_begin)
+        if begin >= block_end:
+            return block_ids[:0]
+        return block_ids[begin - resident_begin : block_end - resident_begin]
 
     transceiver._reuse_adapter.get_block_ids_range.side_effect = get_block_ids_range
 
@@ -311,7 +321,30 @@ def test_build_prefill_chunk_rejects_short_full_attention_range():
     )
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
 
-    with pytest.raises(AssertionError, match="is not fully resident"):
+    with pytest.raises(ValueError, match="is not fully resident"):
+        KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+
+def test_build_prefill_chunk_rejects_overlong_range():
+    """More blocks than the chunk spans means the group is not a run ending at chunk_end."""
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = 1
+    transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [
+        AttentionLayerGroup(pool_group_idx=0, sliding_window_size=2)
+    ]
+    transceiver._reuse_adapter.get_block_ids_range.return_value = np.array(
+        [1, 2, 3], dtype=np.int64
+    )
+    req = MagicMock(
+        py_beam_width=1,
+        prompt_len=4,
+        py_last_context_chunk=(0, 2),
+        context_remaining_length=2,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+
+    with pytest.raises(ValueError, match="which spans only 2"):
         KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
 
 
@@ -394,14 +427,16 @@ def test_send_prefill_chunks_integrity_check():
 
 
 def test_send_prefill_chunks_multiple_layer_groups():
-    """A short layer group contributes only its resident absolute range."""
+    """A sliding-window group contributes only the part of its resident suffix in the chunk."""
     all_block_ids = [list(range(8)), list(range(3))]
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
-    assert slices[1].block_ids_per_layer_groups[1].size == 0
+    # The short group holds ordinals [5, 8), so chunk [0, 4) misses it entirely
+    # and chunk [4, 8) carries all three of its blocks.
+    assert slices[0].block_ids_per_layer_groups[1].size == 0
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
     assert slices[0].token_range == TokenRange(start=0, end=4)
     assert slices[1].token_range == TokenRange(start=4, end=8)
 

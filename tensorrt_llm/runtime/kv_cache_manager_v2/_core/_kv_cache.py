@@ -598,7 +598,22 @@ class _KVCache:
         block_end: int,
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
     ) -> Iterator[int]:
-        """Get valid aggregated page indices for absolute block ordinals.
+        """Get resident aggregated page indices for absolute block ordinals.
+
+        Unlike :meth:`get_aggregated_page_indices`, this method never yields a
+        placeholder for a non-resident block, so a ``valid_only`` switch would
+        have nothing to select. To keep each yielded index's block ordinal
+        recoverable from the count alone, the result is the *contiguous* run of
+        resident blocks that ends at ``block_end``: if a block inside
+        ``[block_begin, block_end)`` is stale, scratch, or unallocated, that
+        block and everything before it is dropped. Consumers therefore read the
+        i-th yielded index as ordinal ``block_end - n + i``, where ``n`` is the
+        number of indices yielded.
+
+        Dropping rather than compacting matters for life cycles that keep sink
+        tokens resident: their valid blocks are a sink prefix plus a window
+        suffix, and yielding both would silently misreport the suffix's
+        position.
 
         Args:
             layer_group_id: Layer group to inspect.
@@ -607,18 +622,34 @@ class _KVCache:
             beam_id: Beam index to read.
 
         Yields:
-            Resident page indices in ``[block_begin, block_end)``. Invalid or
-            stale entries are omitted, so the result can be shorter than the
-            requested range.
+            Resident page indices for ordinals ``[block_end - n, block_end)``.
+            The result can be shorter than the requested range, and empty when
+            the block at ``block_end - 1`` is not resident.
+
+        Raises:
+            ValueError: If the bounds are negative, reversed, or reach past the
+                blocks allocated for this sequence.
         """
         if block_begin < 0 or block_end < 0:
             raise ValueError("block range bounds must be non-negative")
         if block_begin > block_end:
             raise ValueError("block_begin must not exceed block_end")
-        end = min(len(self._blocks), block_end)
-        for block in self._blocks[block_begin:end]:
-            if (holder := block.pages[beam_id][layer_group_id]) is not None:
-                yield holder.page.slot_id
+        if block_end > len(self._blocks):
+            raise ValueError(
+                f"block_end={block_end} exceeds the {len(self._blocks)} allocated blocks; "
+                "the result would not end at block_end, and callers recover block "
+                "ordinals from its length"
+            )
+        blocks = self._blocks[block_begin:block_end]
+        # Walk back from block_end and stop at the first gap: everything from
+        # there on is the contiguous run.
+        first = len(blocks)
+        while first > 0 and blocks[first - 1].pages[beam_id][layer_group_id] is not None:
+            first -= 1
+        for block in blocks[first:]:
+            holder = block.pages[beam_id][layer_group_id]
+            assert holder is not None
+            yield holder.page.slot_id
 
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> "ScratchDesc | None":
         """

@@ -77,11 +77,22 @@ class CacheReuseAdapter(ABC):
     ) -> np.ndarray:
         """Resident block IDs for absolute request ordinals ``[block_begin, block_end)``.
 
-        The result preserves ordinal order and excludes stale, invalid, and
-        not-yet-allocated entries. It can therefore be shorter than the
-        requested range for sliding-window or sparse-residency layer groups.
-        Empty ranges are valid; negative or reversed bounds are programming
-        errors.
+        The result is the *contiguous* run of resident blocks ending at
+        ``block_end``, i.e. ordinals ``[block_end - len(result), block_end)``.
+        It can be shorter than the requested range when leading blocks have been
+        evicted, as under sliding-window attention; blocks at or before any gap
+        are dropped rather than compacted.
+
+        Callers must not reorder or reinterpret the result positionally beyond
+        that rule: the receiver reconstructs each layer group's starting token
+        from ``block_end`` and the result length, so a result that is not a
+        contiguous run ending at ``block_end`` would be written to the wrong
+        offsets.
+
+        Empty ranges are valid. Negative or reversed bounds raise
+        ``ValueError``. A ``block_end`` past the request's allocated blocks also
+        raises, though the exception type is backend-specific (``ValueError``
+        from V2, ``RuntimeError`` out of the C++ manager for V1).
         """
 
     @abstractmethod

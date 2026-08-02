@@ -4495,13 +4495,20 @@ std::vector<std::vector<SizeType32>> BaseKVCacheManager::getCacheBlockIdsRange(
     TLLM_CHECK_WITH_INFO(blockBegin >= 0, "blockBegin must be non-negative");
     TLLM_CHECK_WITH_INFO(blockEnd >= 0, "blockEnd must be non-negative");
     TLLM_CHECK_WITH_INFO(blockBegin <= blockEnd, "blockBegin must not exceed blockEnd");
-    auto const& blockIdsPerBeam = getCacheBlockIds(requestId, windowSize);
-    auto const firstResidentBlock = static_cast<size_t>(getSequence(requestId).getNumFrontBlocksRemoved(windowSize));
+    // Read the block table and the eviction count off the same sequence, so a manager that overrides one but not the
+    // other cannot hand back a block table and a front-eviction count that disagree.
+    auto const& sequence = getSequence(requestId);
+    auto const& blockIdsPerBeam = sequence.getCacheBlockIds(windowSize);
+    auto const firstResidentBlock = static_cast<size_t>(sequence.getNumFrontBlocksRemoved(windowSize));
+    auto const end = static_cast<size_t>(blockEnd);
     std::vector<std::vector<SizeType32>> result;
     result.reserve(blockIdsPerBeam.size());
     for (auto const& blockIds : blockIdsPerBeam)
     {
-        auto const end = std::min(blockIds.size(), static_cast<size_t>(blockEnd));
+        TLLM_CHECK_WITH_INFO(end <= blockIds.size(),
+            "blockEnd=%d exceeds the %zu blocks allocated for request %lu at windowSize=%d; the result would not end "
+            "at blockEnd, and callers recover block ordinals from its size",
+            blockEnd, blockIds.size(), static_cast<unsigned long>(requestId), windowSize);
         auto const begin = std::min(end, std::max(firstResidentBlock, static_cast<size_t>(blockBegin)));
         auto const beginOffset = static_cast<std::ptrdiff_t>(begin);
         auto const endOffset = static_cast<std::ptrdiff_t>(end);

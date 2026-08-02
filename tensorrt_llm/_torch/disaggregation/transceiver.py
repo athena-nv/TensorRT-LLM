@@ -538,8 +538,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         block_begin=chunk_start,
                         block_end=chunk_end,
                     )
-                    if layer_group.sliding_window_size is None:
-                        assert block_ids.size == chunk_block_count, (
+                    # The receiver derives each group's starting token from
+                    # chunk_end minus the number of blocks it received, so a
+                    # group may only ever drop *leading* blocks. Anything else
+                    # writes KV to the wrong offsets, silently.
+                    if block_ids.size > chunk_block_count:
+                        raise ValueError(
+                            f"layer group {group_idx} returned {block_ids.size} blocks for "
+                            f"chunk [{chunk_start}, {chunk_end}), which spans only "
+                            f"{chunk_block_count}"
+                        )
+                    if (
+                        layer_group.sliding_window_size is None
+                        and block_ids.size != chunk_block_count
+                    ):
+                        raise ValueError(
                             f"chunk [{chunk_start}, {chunk_end}) of layer group {group_idx} "
                             f"is not fully resident: got {block_ids.size} of "
                             f"{chunk_block_count} blocks"

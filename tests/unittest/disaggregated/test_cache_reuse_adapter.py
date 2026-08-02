@@ -138,20 +138,51 @@ class TestBlockRangeAdapters:
         kv_cache.get_aggregated_page_indices_range.assert_called_once_with(2, 6, 8)
         np.testing.assert_array_equal(block_ids, [23, 24])
 
-    def test_v2_range_filters_invalid_entries(self):
+    @staticmethod
+    def _fake_v2_cache(*slot_ids):
+        """A ``_KVCache`` stand-in whose blocks hold ``slot_ids`` (None = not resident)."""
+
         def make_block(slot_id):
             holder = (
                 None if slot_id is None else SimpleNamespace(page=SimpleNamespace(slot_id=slot_id))
             )
             return SimpleNamespace(pages=[[holder]])
 
-        kv_cache = SimpleNamespace(
-            _blocks=[make_block(10), make_block(None), make_block(12), make_block(13)]
-        )
+        return SimpleNamespace(_blocks=[make_block(slot_id) for slot_id in slot_ids])
+
+    def test_v2_range_drops_leading_gap(self):
+        """A front-evicted prefix shortens the run without shifting the rest."""
+        kv_cache = self._fake_v2_cache(None, None, 12, 13)
 
         result = list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, 0, 4))
 
-        assert result == [10, 12, 13]
+        assert result == [12, 13]
+
+    def test_v2_range_drops_everything_before_an_interior_gap(self):
+        """Sink blocks before a stale hole must not be compacted onto the window suffix.
+
+        Yielding [10, 12, 13] here would make the receiver read the run as
+        ordinals 1..3 and write block 10's KV over ordinal 1.
+        """
+        kv_cache = self._fake_v2_cache(10, None, 12, 13)
+
+        result = list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, 0, 4))
+
+        assert result == [12, 13]
+
+    def test_v2_range_is_empty_when_the_last_block_is_absent(self):
+        kv_cache = self._fake_v2_cache(10, 11, None)
+
+        result = list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, 0, 3))
+
+        assert result == []
+
+    def test_v2_range_honors_block_begin(self):
+        kv_cache = self._fake_v2_cache(10, 11, 12, 13)
+
+        result = list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, 2, 4))
+
+        assert result == [12, 13]
 
     @pytest.mark.parametrize("block_begin,block_end", [(-1, 1), (0, -1), (2, 1)])
     def test_v2_range_rejects_invalid_bounds(self, block_begin, block_end):
@@ -159,6 +190,25 @@ class TestBlockRangeAdapters:
 
         with pytest.raises(ValueError):
             list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, block_begin, block_end))
+
+    def test_v2_range_rejects_block_end_past_allocation(self):
+        kv_cache = self._fake_v2_cache(10, 11)
+
+        with pytest.raises(ValueError, match="exceeds the 2 allocated blocks"):
+            list(_KVCache.get_aggregated_page_indices_range(kv_cache, 0, 0, 3))
+
+    @pytest.mark.parametrize("block_begin,block_end", [(-1, 1), (0, -1), (2, 1)])
+    def test_v1_manager_rejects_invalid_bounds(self, block_begin, block_end):
+        """V1 must reject the same bounds as V2, with the same exception type."""
+        manager = object.__new__(KVCacheManager)
+        manager.layer_offsets = [0]
+        manager._window_size_by_layer_offset = {0: 128}
+        manager.impl = MagicMock()
+
+        with pytest.raises(ValueError):
+            manager.get_cache_indices_range(1, block_begin, block_end, layer_idx=0)
+
+        manager.impl.get_cache_block_ids_range.assert_not_called()
 
     def test_v1_manager_resolves_layer_window_once_and_forwards_range(self):
         manager = object.__new__(KVCacheManager)
