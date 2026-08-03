@@ -488,6 +488,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether pipelined prefill-transfer is enabled."""
         return self._enable_pipelined_transfer
 
+    def has_inflight_transfer(self, req: LlmRequest) -> bool:
+        """Whether transfer resources are still owned for this request.
+
+        Session membership is the ownership record: a session is registered
+        before its first slice is sent and removed only once the transfer is
+        complete, cancelled, or failed. This is deliberately independent of
+        ``req.state``, which tracks the compute phase and lags behind the
+        transfer during pipelined prefill.
+        """
+        rid = get_unique_rid(req)
+        return rid in self._send_sessions or rid in self._recv_sessions
+
+    def has_any_inflight_transfer(self) -> bool:
+        """Whether any request has transfer resources in flight."""
+        return bool(self._send_sessions) or bool(self._recv_sessions)
+
     def _build_prefill_chunk(
         self,
         req: LlmRequest,
@@ -565,6 +581,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if slice.is_last_slice:
             self._finalize_send(req, session)
+            # This marks the compute-phase boundary only. Transfer ownership
+            # began at the first session.send() above and is tracked by session
+            # membership (has_inflight_transfer), not by req.state.
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")

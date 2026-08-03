@@ -156,6 +156,20 @@ class KvCacheTransceiver(ABC):
         """Whether pipelined prefill-transfer is enabled."""
         return False
 
+    def has_inflight_transfer(self, req: LlmRequest) -> bool:
+        """Whether this transceiver still owns transfer resources for req.
+
+        Independent of ``LlmRequestState``: with pipelined transfer a chunk can
+        be in flight while the request is still in its context-compute phase.
+        True means the request's KV pages may be read by the fabric and must
+        not be released.
+        """
+        return False
+
+    def has_any_inflight_transfer(self) -> bool:
+        """Whether any request has transfer resources in flight."""
+        return False
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError
