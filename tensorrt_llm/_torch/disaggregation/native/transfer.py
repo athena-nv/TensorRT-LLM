@@ -1001,16 +1001,21 @@ class Sender(SenderBase):
             meta_type=WriteMetaType.AUX,
         )
 
-    def dispatch_task(
+    def _build_and_enqueue(
         self,
         task: KVSendTask | AuxSendTask,
-        req_info_snapshot: Optional[dict] = None,
-    ):
-        # req_info_snapshot may be pre-fetched under session.lock by the caller to keep the
-        # critical section small.  When not provided, we fetch it here (legacy / standalone path).
-        if req_info_snapshot is None:
-            req_info_snapshot = dict(self._get_req_info(task._unique_rid) or {})
-        for info in req_info_snapshot.values():
+        info: RecvReqInfo,
+        session: Optional["TxSession"],
+    ) -> bool:
+        """Build one (task, peer) write and hand it to a worker queue.
+
+        Returns False when the write could not be built. A task that never
+        reaches a queue never produces a KV_AGENT_RESULT, so the failure is
+        turned into an explicit session error plus a FAILED result: otherwise
+        the peer's receive task stays TRANSFERRING until the KV transfer
+        timeout, and sibling slices are dropped without a trace.
+        """
+        try:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)
             if isinstance(task, KVSendTask):
@@ -1020,6 +1025,37 @@ class Sender(SenderBase):
             if task._perf_timer is not None:
                 task._perf_timer.record_push_start(trans_meta.peer_rank)
             self._enqueue(trans_meta)
+            return True
+        except Exception as e:
+            slice_id = task.slice_id if isinstance(task, KVSendTask) else NO_SLICE_ID
+            logger.error(
+                f"_build_and_enqueue: failed to dispatch unique_rid={task._unique_rid} "
+                f"sender_slice_id={slice_id} to peer "
+                f"{info.instance_name}{info.instance_rank}: {e}"
+            )
+            if session is not None:
+                # Fails every task on the session, including ones not yet enqueued,
+                # so the request surfaces as DISAGG_TRANS_ERROR instead of stalling.
+                session.set_exception(f"failed to dispatch sender slice {slice_id}: {e}")
+            elif not task.is_done:
+                task.fail(RuntimeError(f"failed to dispatch sender slice {slice_id}: {e}"))
+            self._send_failed_result_to_receiver(info)
+            return False
+
+    def dispatch_task(
+        self,
+        task: KVSendTask | AuxSendTask,
+        req_info_snapshot: Optional[dict] = None,
+        session: Optional["TxSession"] = None,
+    ):
+        # req_info_snapshot may be pre-fetched under session.lock by the caller to keep the
+        # critical section small.  When not provided, we fetch it here (legacy / standalone path).
+        if req_info_snapshot is None:
+            req_info_snapshot = dict(self._get_req_info(task._unique_rid) or {})
+        for info in req_info_snapshot.values():
+            # One task fanned out to many peers: keep going on failure so every
+            # peer is notified rather than left waiting on the timeout.
+            self._build_and_enqueue(task, info, session)
 
     def _start_listener(self):
         def handle_message(messages: list[bytes]):
@@ -1087,35 +1123,43 @@ class Sender(SenderBase):
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
-        # session.lock serializes _enqueue calls from both paths.
+        # session.dispatch_lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
                 self._save_peer_req_info(info)
                 return
-        with session.lock:
-            self._save_peer_req_info(info)
-            tasks = list(session.kv_tasks)
+        # dispatch_lock spans the snapshot *and* the enqueue loop. Releasing it in
+        # between would let a concurrent session.send() push a newer slice into this
+        # peer's queue first, and the receiver completes on the is_last_slice result
+        # without checking that earlier slices landed.
+        with session.dispatch_lock:
+            with session.lock:
+                self._save_peer_req_info(info)
+                tasks = list(session.kv_tasks)
+                is_terminal = session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
             # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
             # Send it directly to unblock the receiver's TRANSFERRING task event;
             # CANCEL_SESSION alone would leave it stuck indefinitely.
-            if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            if not tasks and is_terminal:
                 self._send_failed_result_to_receiver(info)
                 return
-        for task in tasks:
-            if task._perf_timer is not None:
-                task._perf_timer.record_task_start(info.instance_rank)
-            trans_meta = self._build_kv_write_meta(task, info)
-            if task._perf_timer is not None:
-                task._perf_timer.record_push_start(trans_meta.peer_rank)
-            self._enqueue(trans_meta)
+            for task in tasks:
+                # One peer fanned out over many slices: the first failure already
+                # failed the session and notified this peer, so stop rather than
+                # send it a duplicate FAILED per remaining slice.
+                if not self._build_and_enqueue(task, info, session):
+                    return
 
     def _send_failed_result_to_receiver(self, info: RecvReqInfo):
+        # Uses the per-thread DEALER: this is reached from the listener thread and,
+        # via _build_and_enqueue, from the executor thread, while self._dealers is
+        # listener-thread-only.
         try:
             peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
             receiver_slice_id = info.slice_id if info.slice_id is not None else 0
-            self._get_or_connect_dealer(peer_ri.self_endpoint).send(
+            self._get_or_connect_thread_dealer(peer_ri.self_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
@@ -1252,6 +1296,14 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
+        # Orders the two producers that enqueue writes for this session: send()/
+        # send_aux() on the executor thread and Sender._respond_with_kv() replaying
+        # earlier slices for a late-registering peer. Both must hold it from the
+        # moment they decide what to enqueue until the enqueue is done, otherwise a
+        # newer slice can reach a peer's queue ahead of an older one and the
+        # receiver completes on the is_last_slice result while writes are pending.
+        # Always acquired *before* self.lock, never while holding it.
+        self.dispatch_lock = threading.Lock()
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -1292,29 +1344,31 @@ class TxSession(TxSessionBase):
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
     def send(self, slice: KVSlice) -> None:
-        with self.lock:
-            params = self._base_args.params
-            slice_id = len(self.kv_tasks)
-            task = KVSendTask(
-                slice,
-                params,
-                slice_id,
-                prompt_len=self._base_args.prompt_len,
-                beam_width=self._base_args.beam_width,
-            )
-            task._unique_rid = self.disagg_request_id
-            self.kv_tasks.append(task)
-            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
-        self._sender.dispatch_task(task, req_info_snapshot)
+        with self.dispatch_lock:
+            with self.lock:
+                params = self._base_args.params
+                slice_id = len(self.kv_tasks)
+                task = KVSendTask(
+                    slice,
+                    params,
+                    slice_id,
+                    prompt_len=self._base_args.prompt_len,
+                    beam_width=self._base_args.beam_width,
+                )
+                task._unique_rid = self.disagg_request_id
+                self.kv_tasks.append(task)
+                req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+            self._sender.dispatch_task(task, req_info_snapshot, session=self)
 
     def send_aux(self) -> AuxSendTask:
-        with self.lock:
-            params = self._base_args.params
-            task = AuxSendTask(params, self.aux_slot)
-            task._unique_rid = self.disagg_request_id
-            self.aux_task = task
-            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
-        self._sender.dispatch_task(task, req_info_snapshot)
+        with self.dispatch_lock:
+            with self.lock:
+                params = self._base_args.params
+                task = AuxSendTask(params, self.aux_slot)
+                task._unique_rid = self.disagg_request_id
+                self.aux_task = task
+                req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+            self._sender.dispatch_task(task, req_info_snapshot, session=self)
         return task
 
     def pack_aux(self, request: LlmRequest) -> None:

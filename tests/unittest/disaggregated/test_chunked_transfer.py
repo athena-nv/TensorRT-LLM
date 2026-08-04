@@ -18,6 +18,7 @@ These tests validate the session state machine using the real
 TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -38,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     NO_SLICE_ID,
     AgentResult,
     KVSendTask,
+    MessageType,
     RecvReqInfo,
     RxSession,
     Sender,
@@ -794,8 +796,9 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
 
 def _make_transfer_state_request(rid=42, request_id: int = 42):
     return SimpleNamespace(
-        py_disaggregated_params=(DisaggregatedParams(disagg_request_id=rid)
-                                 if rid is not None else None),
+        py_disaggregated_params=(
+            DisaggregatedParams(disagg_request_id=rid) if rid is not None else None
+        ),
         request_id=request_id,
     )
 
@@ -851,8 +854,7 @@ def test_is_request_in_transmission_uses_transceiver_predicate():
     request = SimpleNamespace(state=LlmRequestState.CONTEXT_INIT)
 
     assert PyExecutor._is_request_in_transmission(executor, request)
-    executor.kv_cache_transceiver.has_inflight_transfer.assert_called_once_with(
-        request)
+    executor.kv_cache_transceiver.has_inflight_transfer.assert_called_once_with(request)
 
 
 def test_is_request_in_transmission_false_when_nothing_in_flight():
@@ -877,8 +879,7 @@ def test_try_cancel_request_propagates_mid_write_failure():
     request = SimpleNamespace(state=LlmRequestState.CONTEXT_INIT)
 
     assert not PyExecutor._try_cancel_request(executor, request)
-    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(
-        request)
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
 
 
 def _make_send_kv_executor(canceled_req_ids):
@@ -923,8 +924,7 @@ def test_send_kv_async_sends_intermediate_chunk_when_not_cancelled():
 
     PyExecutor._send_kv_async(executor, [request])
 
-    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(
-        request)
+    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
 
 
 def test_send_kv_async_still_sends_final_chunk_for_cancelled_request():
@@ -936,10 +936,8 @@ def test_send_kv_async_still_sends_final_chunk_for_cancelled_request():
 
     PyExecutor._send_kv_async(executor, [request])
 
-    executor.async_transfer_manager.start_transfer.assert_called_once_with(
-        request)
-    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(
-        request)
+    executor.async_transfer_manager.start_transfer.assert_called_once_with(request)
+    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
 
 
 def _make_timeout_request(request_id: int = 7, elapsed_s: float = 10.0):
@@ -1001,8 +999,7 @@ def test_has_any_inflight_kv_transfer_ors_in_transceiver():
 
 def _make_ctx_status_executor(cancel_succeeds: bool):
     executor = MagicMock()
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = (
-        [], [])
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.cancel_request.return_value = cancel_succeeds
     executor.kv_cache_transceiver.has_inflight_transfer.return_value = True
     executor.async_transfer_manager.requests_in_transfer.return_value = {}
@@ -1036,3 +1033,156 @@ def test_ctx_transfer_status_retries_mid_prefill_timeout_while_mid_write():
 
     assert request.state == LlmRequestState.CONTEXT_INIT
     assert request.py_kv_transfer_start_time is not None
+
+
+# ---------------------------------------------------------------------------
+# Dispatch ordering and per-write error isolation
+# ---------------------------------------------------------------------------
+
+
+def _make_replay_req_info(instance_rank: int = 0) -> RecvReqInfo:
+    return RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=instance_rank,
+        block_ids_per_layer_groups=[np.array([1], dtype=np.int64)],
+        unique_rid=42,
+        slice_id=0,
+    )
+
+
+def _request_data_msg(info: RecvReqInfo) -> list:
+    return [MessageType.REQUEST_DATA, info.to_bytes()]
+
+
+def _make_dispatch_sender(session: TxSession, enqueued: list) -> Sender:
+    """Sender stubbed down to the dispatch bookkeeping, recording enqueue order."""
+    sender = Sender.__new__(Sender)
+    sender._sessions_lock = threading.Lock()
+    sender._get_session = MagicMock(return_value=session)
+    sender._save_peer_req_info = MagicMock()
+    sender._get_req_info = MagicMock(return_value=None)
+    sender._send_failed_result_to_receiver = MagicMock()
+    sender._enqueue = enqueued.append
+    sender._build_kv_write_meta = lambda task, info: _make_write_meta(task.slice_id, 0)
+    sender._build_aux_write_meta = lambda task, info: _make_write_meta(None, 0)
+    return sender
+
+
+def _enqueued_slice_ids(enqueued: list) -> list:
+    return [meta.sender_slice_id for meta in enqueued]
+
+
+def test_replay_enqueues_slices_in_order_under_dispatch_lock():
+    """The late-peer replay holds dispatch_lock for every enqueue it performs."""
+    session = _make_tx_session(2)
+    enqueued = []
+    sender = _make_dispatch_sender(session, enqueued)
+
+    held = []
+    sender._enqueue = lambda meta: (
+        held.append(session.dispatch_lock.locked()),
+        enqueued.append(meta),
+    )
+
+    sender._respond_with_kv(b"", _request_data_msg(_make_replay_req_info()))
+
+    assert held == [True, True]
+    assert _enqueued_slice_ids(enqueued) == [0, 1]
+    sender._send_failed_result_to_receiver.assert_not_called()
+
+
+def test_send_cannot_enqueue_ahead_of_an_in_progress_replay():
+    """A concurrent send() waits for the replay, so the last slice stays last."""
+    session = _make_tx_session(2)
+    enqueued = []
+    sender = _make_dispatch_sender(session, enqueued)
+    session._sender = sender
+
+    in_replay = threading.Event()
+    release = threading.Event()
+
+    def blocking_build(task, info):
+        if task.slice_id == 0:
+            in_replay.set()
+            assert release.wait(timeout=10)
+        return _make_write_meta(task.slice_id, 0)
+
+    sender._build_kv_write_meta = blocking_build
+
+    info = _make_replay_req_info()
+    replay = threading.Thread(target=sender._respond_with_kv, args=(b"", _request_data_msg(info)))
+    replay.start()
+    assert in_replay.wait(timeout=10)
+
+    # The peer is registered now, so send() would dispatch its own chunk.
+    sender._get_req_info = MagicMock(return_value={0: info})
+    sending = threading.Thread(
+        target=session.send,
+        args=(KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[2]]),),
+    )
+    sending.start()
+
+    # send() is parked on dispatch_lock: it has neither appended its task nor enqueued.
+    time.sleep(0.05)
+    assert len(session.kv_tasks) == 2
+    assert enqueued == []
+
+    release.set()
+    replay.join(timeout=10)
+    sending.join(timeout=10)
+
+    assert _enqueued_slice_ids(enqueued) == [0, 1, 2]
+
+
+def test_replay_failure_fails_session_and_notifies_peer_once():
+    """An unbuildable slice must not silently drop its siblings."""
+    session = _make_tx_session(3)
+    enqueued = []
+    sender = _make_dispatch_sender(session, enqueued)
+
+    def build(task, info):
+        if task.slice_id == 1:
+            raise ValueError("src/dst block count mismatch")
+        return _make_write_meta(task.slice_id, 0)
+
+    sender._build_kv_write_meta = build
+
+    sender._respond_with_kv(b"", _request_data_msg(_make_replay_req_info()))
+
+    assert _enqueued_slice_ids(enqueued) == [0]
+    assert session.status == SessionStatus.ERROR
+    # One notification for the peer, not one per remaining slice.
+    assert sender._send_failed_result_to_receiver.call_count == 1
+
+
+def test_dispatch_task_notifies_every_peer_on_failure():
+    """Fanning one slice out to many peers must not leave a peer unnotified."""
+    session = _make_tx_session(1)
+    enqueued = []
+    sender = _make_dispatch_sender(session, enqueued)
+    sender._build_kv_write_meta = MagicMock(side_effect=ValueError("boom"))
+
+    infos = {
+        0: _make_replay_req_info(instance_rank=0),
+        1: _make_replay_req_info(instance_rank=1),
+    }
+    sender.dispatch_task(session.kv_tasks[0], infos, session=session)
+
+    assert enqueued == []
+    assert session.status == SessionStatus.ERROR
+    assert sender._send_failed_result_to_receiver.call_count == 2
+
+
+def test_replay_reports_failure_when_terminal_session_has_no_tasks():
+    """The existing no-tasks abort still fires, now outside session.lock."""
+    session = _make_tx_session(0)
+    session.cancel()
+    enqueued = []
+    sender = _make_dispatch_sender(session, enqueued)
+
+    info = _make_replay_req_info()
+    sender._respond_with_kv(b"", _request_data_msg(info))
+
+    assert enqueued == []
+    sender._send_failed_result_to_receiver.assert_called_once()
