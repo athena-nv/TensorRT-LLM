@@ -51,9 +51,9 @@ class TokenRange:
 
     Both bounds are block-aligned multiples of ``tokens_per_block``, because the
     chunk window is decided in block space (the reuse-prefix extension back to
-    block 0, the round up to the enclosing block, the clamp to the prompt) and
-    the sender divides it back out. An empty range is legal: a chunk clamped
-    past the end of the prompt covers no blocks.
+    block 0, the rounding of the scheduler's bounds, the clamp to the prompt) and
+    the sender divides it back out. An empty range is legal: an empty prompt
+    covers no blocks.
     """
 
     start: int
@@ -88,8 +88,8 @@ class KVSlice:
     ``token_range``, with the extent taken from the session's ``prompt_len``. A
     pipelined chunk sets ``token_range``, its window in the request's token
     space. Chunk geometry is decided once by the producer — the reuse-prefix
-    extension back to block 0, the round up to the enclosing block, the clamp to
-    the prompt end — so the range is block-aligned and the sender reads it
+    extension back to block 0, the rounding of the scheduler's bounds, the clamp
+    to the prompt end — so the range is block-aligned and the sender reads it
     rather than rederiving a window from the scheduler's token bounds.
 
     Per-layer token starts are not carried — the sender derives them from the

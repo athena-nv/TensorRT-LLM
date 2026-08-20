@@ -707,9 +707,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _build_prefill_chunk(
         self,
         req: LlmRequest,
-    ) -> KVSlice:
+    ) -> Optional[KVSlice]:
         """
         Create a KVSlice for a prefill chunk. Project the block IDs to the global chunk.
+
+        Returns None when the chunk completes no block, so there is nothing to send yet.
 
         Args:
             req: The context-only request being prefilled.
@@ -731,21 +733,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # cursor by the time _send_kv_async runs. The recorded chunk start is the
         # pre-advance value.
         is_first_chunk = chunk_start_pos == req.prepopulated_prompt_len
-        # The scheduler is free to cut a chunk anywhere: V1 shrinks the first chunk to
-        # land on a block boundary, but the V2 scheduler rounds the chunk *size* rather
-        # than the absolute end, so an unaligned prepopulated_prompt_len offsets every
-        # boundary. Ends therefore round up and starts round down, which puts the block
-        # holding an unaligned boundary in both chunks. The first copy carries a stale
-        # tail past the boundary; the next chunk rewrites the whole block once it is
-        # computed, and per-peer writes are serialized (see Sender._enqueue), so the
-        # computed copy always lands last.
-        chunk_start_block = 0 if is_first_chunk else chunk_start_pos // tpb
-        chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
         is_last_chunk = req.context_remaining_length == 0
+        # The scheduler is free to cut a chunk anywhere. Both bounds round down, so
+        # consecutive chunks tile block space exactly and the block holding an
+        # unaligned boundary is sent once, by the chunk that computes the rest of it.
+        # The last chunk rounds up instead: its tail is computed and nothing follows.
+        chunk_start_block = 0 if is_first_chunk else chunk_start_pos // tpb
+        chunk_end_block = (
+            (chunk_end_pos + tpb - 1) // tpb if is_last_chunk else chunk_end_pos // tpb
+        )
         total_blocks = (req.prompt_len + tpb - 1) // tpb
 
         chunk_start = min(chunk_start_block, total_blocks)
         chunk_end = min(chunk_end_block, total_blocks)
+        # The next chunk's start rounds down to here, so the skipped blocks travel with
+        # it. The last chunk always sends: it carries is_last_slice.
+        if chunk_end <= chunk_start and not is_last_chunk:
+            return None
         chunk_block_count = max(0, chunk_end - chunk_start)
         # V1 reserves the full prompt up front, while V2 grows its source list
         # incrementally. Normalize both to the current chunk boundary before
@@ -786,6 +790,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return
         if self.pipeline_transfer_enabled:
             slice = self._build_prefill_chunk(req)
+            if slice is None:
+                return
         else:
             slice = self._create_kv_slice(req)
         session.send(slice)

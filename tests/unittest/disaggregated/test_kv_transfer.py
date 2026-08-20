@@ -216,7 +216,8 @@ def _send_prefill_chunks(
 
     ``boundary_offset_tokens`` pushes every interior chunk boundary off a block
     boundary, which is what a scheduler that rounds chunk size rather than absolute
-    position produces. Consecutive chunks then share the block holding the boundary.
+    position produces. The block holding the boundary then travels with the chunk
+    that finishes computing it.
     """
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
@@ -273,6 +274,8 @@ def _send_prefill_chunks(
         req.py_last_context_chunk = (chunk_start_pos, chunk_end_pos)
         req.context_remaining_length = 0 if is_last_chunk else prompt_len - chunk_end_pos
         kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+        if kv_slice is None:
+            continue
         slices.append(kv_slice)
         if sender_session is not None:
             session.send(kv_slice)
@@ -409,8 +412,8 @@ def test_send_prefill_chunks_integrity_check(prepopulated_blocks):
         assert reassembled == original
 
 
-def test_send_prefill_chunks_unaligned_boundary_repeats_one_block():
-    """An interior boundary inside a block puts that block in both neighbouring slices."""
+def test_send_prefill_chunks_unaligned_boundary_splits_on_a_block():
+    """An interior boundary inside a block leaves that block to the next slice."""
     tokens_per_block = 4
     slices = _send_prefill_chunks(
         [list(range(8))],
@@ -420,10 +423,10 @@ def test_send_prefill_chunks_unaligned_boundary_repeats_one_block():
     )
 
     assert [s.token_range for s in slices] == [
-        TokenRange(start=0, end=5 * tokens_per_block),
+        TokenRange(start=0, end=4 * tokens_per_block),
         TokenRange(start=4 * tokens_per_block, end=8 * tokens_per_block),
     ]
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.arange(5))
+    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.arange(4))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.arange(4, 8))
 
 
@@ -1914,7 +1917,7 @@ def add_and_verify_pipelined_request(
     so the block-data comparison below covers the reused prefix too.
 
     ``boundary_offset_tokens`` makes interior chunk boundaries fall inside a block, so
-    consecutive chunks write the same destination block twice.
+    a block is written only by the chunk that finishes computing it.
     """
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
@@ -2064,10 +2067,10 @@ def test_transfer_worker_pipelined_ctx_prefix_reuse(
 def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
     ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
 ):
-    """Chunk boundaries inside a block: the shared block is written by both chunks.
+    """Chunk boundaries inside a block: the boundary block waits for the next chunk.
 
-    _build_prefill_chunk rounds the end up and the next start down, so the generation
-    server receives the boundary block twice and must still end up with the full prompt.
+    _build_prefill_chunk rounds both bounds down, so the generation server receives
+    each block exactly once and must still end up with the full prompt.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

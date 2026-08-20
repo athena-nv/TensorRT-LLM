@@ -803,6 +803,34 @@ def test_pipelined_non_last_chunk_does_not_finalize():
     transceiver._finalize_send.assert_not_called()
 
 
+def test_pipelined_chunk_without_a_complete_block_is_not_sent():
+    """A chunk that completes no block leaves the session untouched."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    session = MagicMock()
+    session.kv_tasks = []
+
+    transceiver = MagicMock()
+    transceiver._enable_pipelined_transfer = True
+    transceiver.kv_transfer_timeout_ms = None
+    transceiver._get_or_create_send_session.return_value = session
+    transceiver._build_prefill_chunk.return_value = None
+
+    request = SimpleNamespace(
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
+        request_id=42,
+        prompt_len=8,
+        py_beam_width=1,
+        py_kv_transfer_start_time=None,
+        set_kv_cache_transfer_start=lambda _ts: None,
+    )
+
+    KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
+
+    session.send.assert_not_called()
+    transceiver._finalize_send.assert_not_called()
+
+
 def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     """Drive two chunks through respond_and_send_async and a real TxSession."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -934,8 +962,8 @@ def _build_prefill_chunk_for(
     )
 
 
-def test_build_prefill_chunk_rounds_unaligned_non_final_end_up():
-    """An unaligned non-final end sends its enclosing block, stale tail and all."""
+def test_build_prefill_chunk_rounds_unaligned_non_final_end_down():
+    """An unaligned non-final end stops at the last block it finished computing."""
     kv_slice = _build_prefill_chunk_tokens_for(
         prepopulated_tokens=0,
         chunk_start_pos=0,
@@ -943,12 +971,12 @@ def test_build_prefill_chunk_rounds_unaligned_non_final_end_up():
     )
 
     assert kv_slice.is_last_slice is False
-    assert kv_slice.token_range == _reuse_token_range(0, 2)
-    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(2, dtype=np.int64))
+    assert kv_slice.token_range == _reuse_token_range(0, 1)
+    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(1, dtype=np.int64))
 
 
-def test_unaligned_chunk_boundary_overlaps_by_exactly_one_block():
-    """Rounding the end up and the next start down covers every block, sharing one."""
+def test_unaligned_chunk_boundaries_tile_block_space_exactly():
+    """Rounding both bounds down covers every block exactly once."""
     chunk_bounds = [(0, 6), (6, 12), (12, _REUSE_TOTAL_BLOCKS * _REUSE_TPB)]
     slices = [
         _build_prefill_chunk_tokens_for(
@@ -962,14 +990,29 @@ def test_unaligned_chunk_boundary_overlaps_by_exactly_one_block():
     block_spans = [
         (s.token_range.start // _REUSE_TPB, s.token_range.end // _REUSE_TPB) for s in slices
     ]
-    assert block_spans == [(0, 2), (1, 3), (3, _REUSE_TOTAL_BLOCKS)]
+    assert block_spans == [(0, 1), (1, 3), (3, _REUSE_TOTAL_BLOCKS)]
 
-    # Every block is covered, and each unaligned boundary repeats a single block.
     covered = [set(range(start, end)) for start, end in block_spans]
     assert set().union(*covered) == set(range(_REUSE_TOTAL_BLOCKS))
-    assert len(covered[0] & covered[1]) == 1
-    assert len(covered[1] & covered[2]) == 0
+    assert sum(len(c) for c in covered) == _REUSE_TOTAL_BLOCKS
     assert slices[-1].is_last_slice is True
+
+
+@pytest.mark.parametrize(
+    "chunk_start_pos,chunk_end_pos",
+    [(0, 2), (5, 7)],
+    ids=["first_chunk", "later_chunk"],
+)
+def test_chunk_completing_no_block_sends_nothing(chunk_start_pos, chunk_end_pos):
+    """A chunk inside a single block has nothing to send; the next chunk covers it."""
+    assert (
+        _build_prefill_chunk_tokens_for(
+            prepopulated_tokens=0,
+            chunk_start_pos=chunk_start_pos,
+            chunk_end_pos=chunk_end_pos,
+        )
+        is None
+    )
 
 
 def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
@@ -980,8 +1023,8 @@ def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
         chunk_end_pos=14,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(0, 4)
-    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(4, dtype=np.int64))
+    assert kv_slice.token_range == _reuse_token_range(0, 3)
+    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(3, dtype=np.int64))
 
 
 def test_first_chunk_covers_ctx_prefix_reuse():
