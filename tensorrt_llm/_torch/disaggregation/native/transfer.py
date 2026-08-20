@@ -872,9 +872,7 @@ class Sender(SenderBase):
         # owner, sharded pools keep head-duplication routing.
         tpb = extractor.page_table.tokens_per_block
         slice_end = task._prompt_len
-        total_blocks = task._slice.total_blocks
-        if total_blocks is None:
-            total_blocks = (slice_end + tpb - 1) // tpb
+        total_blocks = (slice_end + tpb - 1) // tpb
         # Only a pipelined chunk carries a token_range; a monolithic transfer
         # addresses the whole request and keeps its own path below. The producer
         # decides the window in block space, so both bounds are block-aligned

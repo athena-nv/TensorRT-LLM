@@ -89,11 +89,12 @@ class KVSlice:
     pipelined chunk sets ``token_range``, its window in the request's token
     space. Chunk geometry is decided once by the producer — the reuse-prefix
     extension back to block 0, the round up to the enclosing block, the clamp to
-    ``total_blocks`` — so the range is block-aligned and the sender reads it
+    the prompt end — so the range is block-aligned and the sender reads it
     rather than rederiving a window from the scheduler's token bounds.
 
     Per-layer token starts are not carried — the sender derives them from the
     block count:
+        total_blocks    = ceil(prompt_len / tpb)
         suffix_end      = token_range.end // tpb, or total_blocks
         token_start_i   = (suffix_end - len(block_ids_per_layer_groups[i])) * tpb
     Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
@@ -110,7 +111,6 @@ class KVSlice:
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
-    total_blocks: Optional[int] = None
     token_range: Optional[TokenRange] = None
 
 

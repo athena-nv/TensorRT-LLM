@@ -278,7 +278,6 @@ def _make_projection_task(slice_id: int = 1) -> KVSendTask:
                 np.array([4, 5, 6, 7], dtype=np.int64),
                 np.array([10, 11, 12], dtype=np.int64),
             ],
-            total_blocks=8,
             token_range=_projection_token_range(4, 8),
         ),
         _make_params(),
@@ -337,7 +336,6 @@ def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
             KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=src_per_group,
-                total_blocks=8,
                 token_range=token_range,
             ),
             _make_params(),
@@ -365,7 +363,6 @@ def test_build_kv_write_meta_rejects_unaligned_chunk_token_range():
                 np.array([4, 5, 6, 7], dtype=np.int64),
                 np.array([10, 11, 12], dtype=np.int64),
             ],
-            total_blocks=8,
             token_range=TokenRange(start=0, end=_PROJECTION_TPB + 1),
         ),
         _make_params(),

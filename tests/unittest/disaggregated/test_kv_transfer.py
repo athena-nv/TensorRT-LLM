@@ -169,7 +169,6 @@ def test_kv_slice_construction():
     assert s2.block_ids_per_layer_groups == []
     assert s2.is_last_slice is False
     assert s2.token_range is None
-    assert s2.total_blocks is None
 
 
 @pytest.mark.cpu_only
@@ -283,8 +282,8 @@ def _send_prefill_chunks(
     return slices
 
 
-def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
-    """A growing source uses the current chunk end while retaining the full prompt span."""
+def test_build_prefill_chunk_projects_incremental_source_against_chunk_end():
+    """A growing source is projected against the current chunk end, not the full prompt."""
     tokens_per_block = 128
     prompt_blocks = 1000
     chunk_blocks = 16
@@ -321,7 +320,9 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
             kv_slice.block_ids_per_layer_groups[0],
             np.arange(chunk_start, chunk_end, dtype=np.int64),
         )
-        assert kv_slice.total_blocks == prompt_blocks
+        assert kv_slice.token_range == TokenRange(
+            start=chunk_start * tokens_per_block, end=chunk_end * tokens_per_block
+        )
 
 
 @pytest.mark.parametrize(
