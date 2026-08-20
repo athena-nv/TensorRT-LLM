@@ -162,9 +162,8 @@ class WriteMeta:
     dst_ptrs: np.ndarray  # dtype=np.int64
     sizes: np.ndarray  # dtype=np.int64
     dst_device_id: Optional[int] = None
-    sender_slice_id: Optional[int] = None
     # The peer's task index, taken from RecvReqInfo.slice_id.
-    receiver_slice_id: int = 0
+    slice_id: Optional[int] = None
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
@@ -559,8 +558,7 @@ class Sender(SenderBase):
             logger.error(msg)
             write_meta.task.fail(RuntimeError(msg))
             return
-        assert write_meta.sender_slice_id is not None
-        task = session.kv_tasks[write_meta.sender_slice_id]
+        task = write_meta.task
         timer = task._perf_timer
 
         if timer:
@@ -606,7 +604,7 @@ class Sender(SenderBase):
                 # region leak. Tell the receiver it failed and fail the local task instead.
                 logger.error(
                     f"_deliver_kv_to_agent: failed to build the KV send request for "
-                    f"{write_meta.unique_rid} sender_slice_id={write_meta.sender_slice_id}: {e}"
+                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
                 self._send_kv_result_to_receiver(
@@ -626,7 +624,7 @@ class Sender(SenderBase):
                     detail = (
                         f"KV transfer agent failed: "
                         f"unique_rid={write_meta.unique_rid} "
-                        f"sender_slice_id={write_meta.sender_slice_id} "
+                        f"slice={write_meta.slice_id} "
                         f"peer_rank={write_meta.peer_rank} "
                         f"peer_endpoint={write_meta.peer_endpoint} "
                         f"op={getattr(request, 'op', '?')} "
@@ -670,14 +668,14 @@ class Sender(SenderBase):
 
         if count > write_meta.expected_transfers:
             session.set_exception(
-                f"KV sender slice {write_meta.sender_slice_id} received more than "
+                f"KV slice {write_meta.slice_id} received more than "
                 f"{write_meta.expected_transfers} transfers"
             )
         elif count == write_meta.expected_transfers:
             if task.is_done:
                 task.status = TaskStatus.ERROR
                 session.set_exception(
-                    f"KV sender slice {write_meta.sender_slice_id} task already resolved on completion"
+                    f"KV slice {write_meta.slice_id} task already resolved on completion"
                 )
             else:
                 task.complete()
@@ -686,8 +684,7 @@ class Sender(SenderBase):
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
-            f"sender_slice_id={write_meta.sender_slice_id}, "
-            f"receiver_slice_id={write_meta.receiver_slice_id}, agent_result={agent_result}"
+            f"slice_id={write_meta.slice_id}, agent_result={agent_result}"
         )
 
     def _send_kv_result_to_receiver(
@@ -702,15 +699,14 @@ class Sender(SenderBase):
 
         Covers every per-slice outcome (pre-transfer abort, RDMA failure, and
         success). Sender-side chunking is transparent to the receiver because
-        the result addresses the receiver by its own task index
-        (``receiver_slice_id``, echoed from ``RecvReqInfo``). The sender's chunk
-        index remains local for logging.
+        the result addresses the receiver by its own task index, echoed back
+        from ``RecvReqInfo``.
         Uses the per-thread DEALER because this runs on worker threads.
         """
         result_msg = _make_kv_result_msg(
             self._instance_rank,
             write_meta.unique_rid,
-            write_meta.receiver_slice_id,
+            write_meta.slice_id,
             is_last,
             result,
             transfer_size=transfer_size,
@@ -1020,8 +1016,7 @@ class Sender(SenderBase):
             peer_rank=peer_ri.instance_rank,
             peer_endpoint=peer_ri.self_endpoint,
             unique_rid=task._unique_rid,
-            sender_slice_id=task.slice_id,
-            receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
+            slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._slice.is_last_slice,
             bounce_dst_base=req_info.bounce_dst_base,
         )

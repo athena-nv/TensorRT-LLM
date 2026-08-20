@@ -316,10 +316,8 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
         np.array([104, 105, 106, 107, 200, 201, 202], dtype=np.int64),
     )
     assert np.array_equal(write_meta.sizes, np.ones(7, dtype=np.int64))
-    # The sender's chunk index and the peer's task index are tracked separately;
-    # a receiver that sends no slice_id is addressed as its single task 0.
-    assert write_meta.sender_slice_id == 1
-    assert write_meta.receiver_slice_id == 0
+    # A receiver that sends no slice_id is addressed as its single task 0.
+    assert write_meta.slice_id == 0
 
 
 def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
@@ -379,16 +377,15 @@ def test_build_kv_write_meta_rejects_unaligned_chunk_token_range():
         sender._build_kv_write_meta(task, _make_projection_req_info())
 
 
-def test_build_kv_write_meta_echoes_receiver_slice_id():
-    """receiver_slice_id comes from the peer's RecvReqInfo, not the sender's chunk index."""
+def test_build_kv_write_meta_echoes_peer_slice_id():
+    """The slice id on the wire comes from the peer's RecvReqInfo, not the sender's chunk."""
     sender = _make_projection_sender()
 
     write_meta = sender._build_kv_write_meta(
         _make_projection_task(slice_id=1), _make_projection_req_info(slice_id=3)
     )
 
-    assert write_meta.sender_slice_id == 1
-    assert write_meta.receiver_slice_id == 3
+    assert write_meta.slice_id == 3
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +393,7 @@ def test_build_kv_write_meta_echoes_receiver_slice_id():
 # ---------------------------------------------------------------------------
 
 
-def _make_write_meta(sender_slice_id, receiver_slice_id) -> WriteMeta:
+def _make_write_meta(slice_id) -> WriteMeta:
     empty = np.array([], dtype=np.int64)
     return WriteMeta(
         task=MagicMock(),
@@ -408,27 +405,26 @@ def _make_write_meta(sender_slice_id, receiver_slice_id) -> WriteMeta:
         src_ptrs=empty,
         dst_ptrs=empty,
         sizes=empty,
-        sender_slice_id=sender_slice_id,
-        receiver_slice_id=receiver_slice_id,
+        slice_id=slice_id,
     )
 
 
-def test_send_kv_result_uses_receiver_slice_id():
-    """The existing result-frame slice field addresses the peer's own task."""
+def test_send_kv_result_uses_peer_slice_id():
+    """The result-frame slice field addresses the peer's own task."""
     sender = Sender.__new__(Sender)
     sender._instance_rank = 5
     dealer = MagicMock()
     sender._get_or_connect_thread_dealer = MagicMock(return_value=dealer)
 
     sender._send_kv_result_to_receiver(
-        _make_write_meta(sender_slice_id=4, receiver_slice_id=2),
+        _make_write_meta(slice_id=2),
         is_last=True,
         result=AgentResult.SUCCESS,
     )
 
     (msg,), _ = dealer.send.call_args
-    rank, rid, receiver_slice_id, is_last, _code, _size = _KV_RESULT_PREFIX.unpack(msg[1])
-    assert (rank, rid, receiver_slice_id, is_last) == (5, 42, 2, True)
+    rank, rid, slice_id, is_last, _code, _size = _KV_RESULT_PREFIX.unpack(msg[1])
+    assert (rank, rid, slice_id, is_last) == (5, 42, 2, True)
 
 
 def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
