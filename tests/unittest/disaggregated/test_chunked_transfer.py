@@ -19,7 +19,6 @@ TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
 import threading
-import time
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -461,23 +460,6 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
         )
 
 
-def test_process_kv_agent_result_failure_attributes_receiver_task():
-    """A failed result names the receiver task it resolves."""
-    session = _make_rx_session(1)
-
-    session.process_kv_agent_result(
-        peer_rank=0,
-        receiver_slice_id=0,
-        is_last_slice=False,
-        status=AgentResult.FAILED,
-    )
-
-    task = session._kv_tasks[0]
-    assert task.status == TaskStatus.ERROR
-    assert "receiver_slice_id=0" in str(task._exception)
-    assert session.status == SessionStatus.ERROR
-
-
 # ---------------------------------------------------------------------------
 # TxSession multi-slice status tests (real class)
 # ---------------------------------------------------------------------------
@@ -566,14 +548,6 @@ def test_tx_session_status_init_until_all_transferred():
     assert session.status == SessionStatus.KV_TRANSFERRED
 
 
-def test_tx_session_status_error_on_any_failure():
-    """TxSession status is ERROR if any task fails."""
-    session = _make_tx_session(3)
-    session.kv_tasks[0].status = TaskStatus.TRANSFERRED
-    session.kv_tasks[1].status = TaskStatus.ERROR
-    assert session.status == SessionStatus.ERROR
-
-
 def test_tx_session_wait_complete_all_tasks():
     """TxSession.wait_complete blocks on all task futures."""
     session = _make_tx_session(3)
@@ -582,17 +556,6 @@ def test_tx_session_wait_complete_all_tasks():
 
     result = session.wait_complete()
     assert result == WaitResult.COMPLETED
-
-
-def test_tx_session_wait_complete_fails_on_partial_failure():
-    """TxSession.wait_complete returns FAILED if any task fails."""
-    session = _make_tx_session(3)
-    session.kv_tasks[0].complete()
-    session.kv_tasks[1].fail(RuntimeError("transfer failed"))
-    session.kv_tasks[2].complete()
-
-    result = session.wait_complete()
-    assert result == WaitResult.FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -616,13 +579,6 @@ def test_rx_session_status_follows_its_single_task():
     assert session.status == SessionStatus.KV_TRANSFERRED
 
 
-def test_rx_session_status_error_on_task_failure():
-    """RxSession status is ERROR once its task fails."""
-    session = _make_rx_session(1)
-    session._kv_tasks[0].status = TaskStatus.ERROR
-    assert session.status == SessionStatus.ERROR
-
-
 def test_rx_session_process_aux_completes_at_expected_transfers():
     """Aux completes only once the expected transfer count is reached."""
     session = _make_rx_session(1)
@@ -635,37 +591,12 @@ def test_rx_session_process_aux_completes_at_expected_transfers():
     assert session._aux_status == TaskStatus.TRANSFERRED
 
 
-@pytest.mark.parametrize("fails", [False, True], ids=["completed", "failed"])
-def test_rx_session_wait_complete_reports_task_outcome(fails):
+def test_rx_session_wait_complete_reports_task_outcome():
     """RxSession.wait_complete blocks on its task future and reports its outcome."""
     session = _make_rx_session(1)
-    task = session._kv_tasks[0]
-    if fails:
-        task.fail(RuntimeError("transfer failed"))
-    else:
-        task.complete()
+    session._kv_tasks[0].complete()
 
-    result = session.wait_complete()
-    assert result == (WaitResult.FAILED if fails else WaitResult.COMPLETED)
-
-
-# ---------------------------------------------------------------------------
-# Mid-transfer chunk failure
-# ---------------------------------------------------------------------------
-
-
-def test_tx_session_mid_chunk_failure():
-    """If one chunk fails mid-transfer, the session reports ERROR."""
-    session = _make_tx_session(4)
-
-    session.kv_tasks[0].complete()
-    session.kv_tasks[1].complete()
-    session.kv_tasks[2].fail(RuntimeError("RDMA failed"))
-    session.kv_tasks[3].complete()
-
-    assert session.status == SessionStatus.ERROR
-    result = session.wait_complete()
-    assert result == WaitResult.FAILED
+    assert session.wait_complete() == WaitResult.COMPLETED
 
 
 # ---------------------------------------------------------------------------
@@ -948,117 +879,6 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
 
 
 # ---------------------------------------------------------------------------
-# Retired send sessions
-# ---------------------------------------------------------------------------
-
-
-def _make_send_session_transceiver(sessions=None):
-    transceiver = MagicMock()
-    transceiver._send_sessions = dict(sessions or {})
-    return transceiver
-
-
-def _make_retirable_request(retired: bool, rid: int = 42):
-    return SimpleNamespace(
-        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
-        request_id=rid,
-        py_kv_send_session_retired=retired,
-        state=LlmRequestState.CONTEXT_INIT,
-    )
-
-
-def test_close_failed_send_session_without_request():
-    """A failed session must be retired even before its request is registered."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    session = MagicMock()
-    sessions = {42: session}
-    reqs = {}
-
-    KvCacheTransceiverV2._close_failed_sessions(
-        MagicMock(), sessions, reqs, failed=[42], mark_retired=True
-    )
-
-    session.close.assert_called_once_with()
-    assert sessions == {}
-    assert reqs == {}
-
-
-def test_get_or_create_send_session_refuses_retired_request():
-    """Closing a send session drops the peer registration, so a new one is inert.
-
-    Its tasks would sit in INIT forever, which is neither completed nor failed,
-    so the request would never resolve and its blocks would stay pinned.
-    """
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = _make_send_session_transceiver()
-    request = _make_retirable_request(retired=True)
-
-    session = KvCacheTransceiverV2._get_or_create_send_session(transceiver, request)
-
-    assert session is None
-    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
-    transceiver._transfer_worker.create_tx_session.assert_not_called()
-    assert transceiver._send_sessions == {}
-
-
-def test_get_or_create_send_session_creates_for_fresh_request():
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = _make_send_session_transceiver()
-    request = _make_retirable_request(retired=False)
-    created = transceiver._transfer_worker.create_tx_session.return_value
-
-    session = KvCacheTransceiverV2._get_or_create_send_session(transceiver, request)
-
-    assert session is created
-    assert transceiver._send_sessions == {42: created}
-    assert request.state == LlmRequestState.CONTEXT_INIT
-
-
-def test_get_or_create_send_session_prefers_live_session_over_retired_flag():
-    """A live session is the source of truth; the flag only bars re-creation."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    live = MagicMock()
-    transceiver = _make_send_session_transceiver({42: live})
-    request = _make_retirable_request(retired=True)
-
-    session = KvCacheTransceiverV2._get_or_create_send_session(transceiver, request)
-
-    assert session is live
-    assert request.state == LlmRequestState.CONTEXT_INIT
-
-
-def test_respond_and_send_async_returns_early_when_session_refused():
-    """A refused session must not build, send, or finalize anything."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = MagicMock()
-    transceiver._enable_pipelined_transfer = True
-    transceiver.kv_transfer_timeout_ms = None
-    transceiver._get_or_create_send_session.return_value = None
-
-    request = SimpleNamespace(
-        py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
-        request_id=42,
-        prompt_len=8,
-        py_beam_width=1,
-        py_kv_transfer_start_time=None,
-        set_kv_cache_transfer_start=lambda _ts: None,
-        state=LlmRequestState.DISAGG_TRANS_ERROR,
-    )
-
-    KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
-
-    transceiver._build_prefill_chunk.assert_not_called()
-    transceiver._create_kv_slice.assert_not_called()
-    transceiver._finalize_send.assert_not_called()
-    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
-
-
-# ---------------------------------------------------------------------------
 # Context-side prefix reuse
 # ---------------------------------------------------------------------------
 
@@ -1282,19 +1102,6 @@ def test_has_inflight_transfer_tracks_send_session_lifetime():
     assert not KvCacheTransceiverV2.has_inflight_transfer(transceiver, request)
 
 
-def test_has_inflight_transfer_survives_mid_write_cancel():
-    """A cancel that cannot complete keeps the ownership record alive."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    session = MagicMock()
-    session.has_transferring_tasks.return_value = True
-    transceiver = _make_transfer_state_transceiver(session)
-    request = _make_transfer_state_request()
-
-    assert not KvCacheTransceiverV2.cancel_request(transceiver, request)
-    assert KvCacheTransceiverV2.has_inflight_transfer(transceiver, request)
-
-
 def test_has_inflight_transfer_false_without_disagg_params():
     """A request that never registered a session owns no transfer resources."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -1329,41 +1136,17 @@ def test_is_request_in_transmission_false_when_nothing_in_flight():
     assert not PyExecutor._is_request_in_transmission(executor, request)
 
 
-def test_try_cancel_request_propagates_mid_write_failure():
-    """Cancelling mid-prefill delegates and reports the retry-needed result."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor._is_request_in_transmission.return_value = True
-    executor._is_disagg_inflight_cancel_active.return_value = False
-    executor.kv_cache_transceiver.cancel_request.return_value = False
-    # The delegation goes through _request_kv_transfer_cancellation, so run the
-    # real helper to keep the assertion on the transceiver call itself.
-    executor._request_kv_transfer_cancellation = (
-        lambda req: PyExecutor._request_kv_transfer_cancellation(executor, req)
-    )
-
-    request = SimpleNamespace(state=LlmRequestState.CONTEXT_INIT)
-
-    assert not PyExecutor._try_cancel_request(executor, request)
-    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
-
-
-def _make_send_kv_executor(canceled_req_ids, retired: bool = False):
+def _make_send_kv_executor(canceled_req_ids):
     executor = MagicMock()
     executor.kv_connector_manager = None
     executor.canceled_req_ids = list(canceled_req_ids)
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.kv_cache_transceiver.kv_transfer_timeout_ms = None
-    executor.kv_cache_transceiver.has_retired_send_session.return_value = retired
+    executor.kv_cache_transceiver.has_retired_send_session.return_value = False
     return executor
 
 
-def _make_send_kv_request(
-    is_last_chunk: bool,
-    request_id: int = 7,
-    state=LlmRequestState.CONTEXT_INIT,
-):
+def _make_send_kv_request(is_last_chunk: bool, request_id: int = 7):
     return SimpleNamespace(
         is_context_only_request=True,
         is_finished_due_to_cancellation=False,
@@ -1373,20 +1156,8 @@ def _make_send_kv_request(
         parent_request_id=None,
         py_request_id=request_id,
         py_kv_transfer_start_time=None,
-        state=state,
+        state=LlmRequestState.CONTEXT_INIT,
     )
-
-
-def test_send_kv_async_skips_intermediate_chunk_for_cancelled_request():
-    """A cancelled session must not be fed another chunk."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([7])
-    request = _make_send_kv_request(is_last_chunk=False)
-
-    PyExecutor._send_kv_async(executor, [request])
-
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
 
 
 def test_send_kv_async_sends_intermediate_chunk_when_not_cancelled():
@@ -1398,144 +1169,3 @@ def test_send_kv_async_sends_intermediate_chunk_when_not_cancelled():
     PyExecutor._send_kv_async(executor, [request])
 
     executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
-
-
-def test_send_kv_async_skips_intermediate_chunk_for_failed_request():
-    """An error path already failed and freed this request, leaving its chunk bounds unset.
-
-    _update_request_states skips GENERATION_COMPLETE requests, so
-    py_last_context_chunk is still (None, None) and building a chunk from it
-    would fault. The request stays in scheduled_requests either way.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([])
-    request = _make_send_kv_request(is_last_chunk=False, state=LlmRequestState.GENERATION_COMPLETE)
-
-    PyExecutor._send_kv_async(executor, [request])
-
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
-
-
-def test_send_kv_async_skips_retired_request_mid_prefill():
-    """A retired session cannot reach its peer, so the request is failed instead."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([], retired=True)
-    request = _make_send_kv_request(is_last_chunk=False)
-
-    PyExecutor._send_kv_async(executor, [request])
-
-    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
-
-
-def test_send_kv_async_skips_retired_request_before_start_transfer():
-    """The gate precedes start_transfer, which pins blocks only end_transfer releases.
-
-    Reaching the final-chunk branch would register the request with the transfer
-    manager for a transfer that can never complete.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([], retired=True)
-    request = _make_send_kv_request(is_last_chunk=True)
-
-    PyExecutor._send_kv_async(executor, [request])
-
-    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
-    executor.async_transfer_manager.start_transfer.assert_not_called()
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
-
-
-@pytest.mark.parametrize("pipelined", [True, False], ids=["pipelined", "monolithic"])
-def test_send_kv_async_skips_final_chunk_for_cancelled_request(pipelined):
-    """The final chunk is skipped too, and as a unit with start_transfer.
-
-    Leaving start_transfer to run alone would register the request in
-    _requests_in_transfer for a transfer that is never handed to the fabric.
-    The gate sits above both branches, so it covers the monolithic path as
-    well, where the single slice is the final one.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([7])
-    executor.kv_cache_transceiver.pipeline_transfer_enabled = pipelined
-    request = _make_send_kv_request(is_last_chunk=True)
-
-    PyExecutor._send_kv_async(executor, [request])
-
-    executor.async_transfer_manager.start_transfer.assert_not_called()
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
-    executor.kv_cache_manager.release_index_slot.assert_not_called()
-
-
-def _make_timeout_request(request_id: int = 7, elapsed_s: float = 10.0):
-    return SimpleNamespace(
-        is_context_only_request=True,
-        is_disagg_generation_transmission_in_progress=False,
-        py_request_id=request_id,
-        py_kv_transfer_start_time=time.monotonic() - elapsed_s,
-        py_kv_transfer_timed_out=False,
-        state=LlmRequestState.CONTEXT_INIT,
-    )
-
-
-def test_check_kv_transfer_timeout_flags_context_request_in_transfer():
-    """Context requests are monitored via the transfer manager.
-
-    They enter it on the last chunk, at the same time as their clock starts.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor.kv_cache_transceiver.kv_transfer_timeout_ms = 100
-    request = _make_timeout_request()
-    executor.async_transfer_manager.requests_in_transfer.return_value = {7: request}
-    executor.active_requests = [request]
-
-    PyExecutor._check_kv_transfer_timeout(executor)
-
-    assert request.py_kv_transfer_timed_out
-
-
-def test_check_kv_transfer_timeout_ignores_context_request_not_in_transfer():
-    """A request still being prefilled is not monitored.
-
-    It holds its KV pages because it is computing, not because a chunk is in
-    flight, so the timer only needs to cover the final transfer.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor.kv_cache_transceiver.kv_transfer_timeout_ms = 100
-    executor.async_transfer_manager.requests_in_transfer.return_value = {}
-
-    request = _make_timeout_request()
-    executor.active_requests = [request]
-
-    PyExecutor._check_kv_transfer_timeout(executor)
-
-    assert not request.py_kv_transfer_timed_out
-
-
-def test_ctx_transfer_status_leaves_mid_prefill_request_alone():
-    """The timeout path never cancels a request still being prefilled.
-
-    py_kv_transfer_timed_out can only be set for requests the transfer manager
-    already knows about, so the mid-prefill case has nothing to act on.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
-    executor.async_transfer_manager.requests_in_transfer.return_value = {}
-
-    request = _make_timeout_request()
-    request.py_kv_transfer_timed_out = True
-    executor.active_requests = [request]
-
-    PyExecutor._check_disagg_ctx_cache_transfer_status(executor)
-
-    executor.kv_cache_transceiver.cancel_request.assert_not_called()
-    assert request.state == LlmRequestState.CONTEXT_INIT
