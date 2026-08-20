@@ -282,8 +282,8 @@ class KVSendTask(SendTaskBase):
 
     Args:
         kv_slice: The KV slice describing which blocks to transfer.
-            For pipelined chunks, ``chunk`` is the shared global chunk cursor
-            in block units.
+            For pipelined chunks, ``token_range`` is the shared global chunk
+            cursor, block-aligned in token units.
         params: Disaggregated serving parameters for this request.
         slice_id: Index of this slice within the session's task list.
     """
@@ -879,15 +879,25 @@ class Sender(SenderBase):
         total_blocks = task._slice.total_blocks
         if total_blocks is None:
             total_blocks = (slice_end + tpb - 1) // tpb
-        # Only a pipelined chunk carries block-space coordinates; a monolithic
-        # transfer addresses the whole request and keeps its own path below.
-        chunk = task._slice.chunk
-        # Resident block lists are the suffix of a range ending at the
-        # current global chunk boundary when pipelined, or at the full
-        # prompt end otherwise. token_start = (suffix_end - n_blocks) * tpb.
-        suffix_end_blocks = (
-            chunk.block_offset + chunk.block_count if chunk is not None else total_blocks
-        )
+        # Only a pipelined chunk carries a token_range; a monolithic transfer
+        # addresses the whole request and keeps its own path below. The producer
+        # decides the window in block space, so both bounds are block-aligned
+        # and the division back out is exact.
+        #
+        # Resident block lists are the suffix of a range ending at the current
+        # global chunk boundary when pipelined, or at the full prompt end
+        # otherwise. token_start = (suffix_end - n_blocks) * tpb.
+        token_range = task._slice.token_range
+        if token_range is not None:
+            assert token_range.start % tpb == 0 and token_range.end % tpb == 0, (
+                f"chunk token_range [{token_range.start}, {token_range.end}) is not "
+                f"block-aligned (tpb={tpb})"
+            )
+            chunk_start_block = token_range.start // tpb
+            suffix_end_blocks = token_range.end // tpb
+        else:
+            chunk_start_block = 0
+            suffix_end_blocks = total_blocks
 
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
             if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
@@ -898,12 +908,12 @@ class Sender(SenderBase):
             # When sender uses chunking, the receiver sends all dst blocks
             # in a single RecvReqInfo. Project the global chunk cursor into
             # each destination layer group's resident/windowed block range.
-            if chunk is not None:
+            if token_range is not None:
                 dst_projectable_blocks = full_dst_block_ids[:total_blocks]
                 dst_block_ids = project_blocks_to_global_chunk(
                     dst_projectable_blocks,
-                    chunk_block_offset=chunk.block_offset,
-                    chunk_block_count=chunk.block_count,
+                    chunk_block_offset=chunk_start_block,
+                    chunk_block_count=suffix_end_blocks - chunk_start_block,
                     resident_block_end=total_blocks,
                 )
             else:

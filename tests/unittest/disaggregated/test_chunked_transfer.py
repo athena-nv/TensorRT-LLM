@@ -28,9 +28,9 @@ import pytest
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
-    ChunkCoords,
     KVSlice,
     SessionStatus,
+    TokenRange,
     WaitResult,
     project_blocks_to_global_chunk,
 )
@@ -214,6 +214,14 @@ def test_chunk_projection_maps_prefix_reuse_suffix_by_overlap():
     assert np.array_equal(second_chunk, block_ids)
 
 
+_PROJECTION_TPB = 8
+
+
+def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
+    """A chunk's block window as the block-aligned token range that rides the slice."""
+    return TokenRange(start=start_block * _PROJECTION_TPB, end=end_block * _PROJECTION_TPB)
+
+
 def _make_projection_sender() -> Sender:
     """Create a Sender wired to a stub registrar with two non-windowed layer groups."""
     peer_ri = SimpleNamespace(
@@ -226,7 +234,7 @@ def _make_projection_sender() -> Sender:
 
     extractor = MagicMock()
     extractor.page_table = SimpleNamespace(
-        tokens_per_block=8,
+        tokens_per_block=_PROJECTION_TPB,
         layer_groups=[
             SimpleNamespace(sliding_window_size=None),
             SimpleNamespace(sliding_window_size=None),
@@ -272,7 +280,7 @@ def _make_projection_task(slice_id: int = 1) -> KVSendTask:
                 np.array([10, 11, 12], dtype=np.int64),
             ],
             total_blocks=8,
-            chunk=ChunkCoords(block_offset=4, block_count=4),
+            token_range=_projection_token_range(4, 8),
         ),
         _make_params(),
         slice_id=slice_id,
@@ -327,13 +335,13 @@ def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
         np.array([10, 11, 12], dtype=np.int64),
     ]
 
-    def task_for(chunk):
+    def task_for(token_range):
         return KVSendTask(
             KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=src_per_group,
                 total_blocks=8,
-                chunk=chunk,
+                token_range=token_range,
             ),
             _make_params(),
             slice_id=0,
@@ -341,13 +349,35 @@ def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
         )
 
     chunked = sender._build_kv_write_meta(
-        task_for(ChunkCoords(block_offset=0, block_count=8)), _make_projection_req_info()
+        task_for(_projection_token_range(0, 8)), _make_projection_req_info()
     )
     monolithic = sender._build_kv_write_meta(task_for(None), _make_projection_req_info())
 
     assert np.array_equal(chunked.src_ptrs, monolithic.src_ptrs)
     assert np.array_equal(chunked.dst_ptrs, monolithic.dst_ptrs)
     assert np.array_equal(chunked.sizes, monolithic.sizes)
+
+
+def test_build_kv_write_meta_rejects_unaligned_chunk_token_range():
+    """The window is decided in block space, so a partial block on the wire is a bug."""
+    sender = _make_projection_sender()
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[
+                np.array([4, 5, 6, 7], dtype=np.int64),
+                np.array([10, 11, 12], dtype=np.int64),
+            ],
+            total_blocks=8,
+            token_range=TokenRange(start=0, end=_PROJECTION_TPB + 1),
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=64,
+    )
+
+    with pytest.raises(AssertionError, match="not block-aligned"):
+        sender._build_kv_write_meta(task, _make_projection_req_info())
 
 
 def test_build_kv_write_meta_echoes_receiver_slice_id():
@@ -901,9 +931,9 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     request.context_remaining_length = 0
     transceiver.respond_and_send_async(request)
 
-    assert [task._slice.chunk for task in session.kv_tasks] == [
-        ChunkCoords(block_offset=0, block_count=2),
-        ChunkCoords(block_offset=2, block_count=2),
+    assert [task._slice.token_range for task in session.kv_tasks] == [
+        TokenRange(start=0, end=2 * tokens_per_block),
+        TokenRange(start=2 * tokens_per_block, end=4 * tokens_per_block),
     ]
     assert [task._slice.block_ids_per_layer_groups[0].tolist() for task in session.kv_tasks] == [
         [0, 1],
@@ -1036,6 +1066,11 @@ _REUSE_TPB = 4
 _REUSE_TOTAL_BLOCKS = 8
 
 
+def _reuse_token_range(start_block: int, end_block: int) -> TokenRange:
+    """A chunk's block window as the block-aligned token range that rides the slice."""
+    return TokenRange(start=start_block * _REUSE_TPB, end=end_block * _REUSE_TPB)
+
+
 def _build_prefill_chunk_tokens_for(
     prepopulated_tokens,
     chunk_start_pos,
@@ -1095,7 +1130,7 @@ def test_build_prefill_chunk_rounds_unaligned_non_final_end_up():
     )
 
     assert kv_slice.is_last_slice is False
-    assert kv_slice.chunk == ChunkCoords(block_offset=0, block_count=2)
+    assert kv_slice.token_range == _reuse_token_range(0, 2)
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(2, dtype=np.int64))
 
 
@@ -1112,7 +1147,7 @@ def test_unaligned_chunk_boundary_overlaps_by_exactly_one_block():
     ]
 
     block_spans = [
-        (s.chunk.block_offset, s.chunk.block_offset + s.chunk.block_count) for s in slices
+        (s.token_range.start // _REUSE_TPB, s.token_range.end // _REUSE_TPB) for s in slices
     ]
     assert block_spans == [(0, 2), (1, 3), (3, _REUSE_TOTAL_BLOCKS)]
 
@@ -1132,7 +1167,7 @@ def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
         chunk_end_pos=14,
     )
 
-    assert kv_slice.chunk == ChunkCoords(block_offset=0, block_count=4)
+    assert kv_slice.token_range == _reuse_token_range(0, 4)
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(4, dtype=np.int64))
 
 
@@ -1144,7 +1179,7 @@ def test_first_chunk_covers_ctx_prefix_reuse():
         chunk_end_block=6,
     )
 
-    assert kv_slice.chunk == ChunkCoords(block_offset=0, block_count=6)
+    assert kv_slice.token_range == _reuse_token_range(0, 6)
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(6, dtype=np.int64))
     assert kv_slice.is_last_slice is False
 
@@ -1169,10 +1204,7 @@ def test_only_the_first_chunk_extends_to_block_zero(
         resident_blocks=_REUSE_TOTAL_BLOCKS,
     )
 
-    assert kv_slice.chunk == ChunkCoords(
-        block_offset=expected_start_block,
-        block_count=chunk_end_block - expected_start_block,
-    )
+    assert kv_slice.token_range == _reuse_token_range(expected_start_block, chunk_end_block)
     assert np.array_equal(
         kv_slice.block_ids_per_layer_groups[0],
         np.arange(expected_start_block, chunk_end_block, dtype=np.int64),
@@ -1194,7 +1226,7 @@ def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
     )
 
     assert kv_slice.is_last_slice is True
-    assert kv_slice.chunk == ChunkCoords(block_offset=0, block_count=_REUSE_TOTAL_BLOCKS)
+    assert kv_slice.token_range == _reuse_token_range(0, _REUSE_TOTAL_BLOCKS)
     assert np.array_equal(
         kv_slice.block_ids_per_layer_groups[0],
         np.arange(_REUSE_TOTAL_BLOCKS, dtype=np.int64),

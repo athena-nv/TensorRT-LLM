@@ -40,10 +40,10 @@ else:
     TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
-    ChunkCoords,
     KVSlice,
     LayerRange,
     SessionStatus,
+    TokenRange,
     WaitResult,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
@@ -99,6 +99,34 @@ class KvCacheConfigV2:
 
 
 @pytest.mark.cpu_only
+def test_token_range_valid():
+    tr = TokenRange(start=0, end=10)
+    assert tr.start == 0
+    assert tr.end == 10
+
+
+@pytest.mark.cpu_only
+def test_token_range_allows_empty():
+    """A chunk clamped past the end of the prompt covers no tokens."""
+    tr = TokenRange(start=8, end=8)
+    assert tr.start == tr.end == 8
+
+
+@pytest.mark.cpu_only
+def test_token_range_invalid_negative():
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenRange(start=-1, end=5)
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenRange(start=0, end=-1)
+
+
+@pytest.mark.cpu_only
+def test_token_range_invalid_start_gt_end():
+    with pytest.raises(ValueError, match="Invalid range"):
+        TokenRange(start=10, end=3)
+
+
+@pytest.mark.cpu_only
 def test_layer_range_valid():
     lr = LayerRange(start=0, end=32)
     assert lr.start == 0
@@ -128,19 +156,19 @@ def test_kv_slice_construction():
         layer_range=lr,
         block_ids_per_layer_groups=[[1, 2, 3]],
         is_last_slice=True,
-        chunk=ChunkCoords(block_offset=0, block_count=3),
+        token_range=TokenRange(start=0, end=3),
     )
     assert s.layer_range == lr
     assert s.block_ids_per_layer_groups == [[1, 2, 3]]
     assert s.is_last_slice is True
-    assert s.chunk == ChunkCoords(block_offset=0, block_count=3)
+    assert s.token_range == TokenRange(start=0, end=3)
 
     # Test defaults
     s2 = KVSlice()
     assert s2.layer_range is None
     assert s2.block_ids_per_layer_groups == []
     assert s2.is_last_slice is False
-    assert s2.chunk is None
+    assert s2.token_range is None
     assert s2.total_blocks is None
 
 
@@ -390,9 +418,9 @@ def test_send_prefill_chunks_unaligned_boundary_repeats_one_block():
         boundary_offset_tokens=2,
     )
 
-    assert [s.chunk for s in slices] == [
-        ChunkCoords(block_offset=0, block_count=5),
-        ChunkCoords(block_offset=4, block_count=4),
+    assert [s.token_range for s in slices] == [
+        TokenRange(start=0, end=5 * tokens_per_block),
+        TokenRange(start=4 * tokens_per_block, end=8 * tokens_per_block),
     ]
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.arange(5))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.arange(4, 8))
@@ -407,8 +435,9 @@ def test_send_prefill_chunks_multiple_layer_groups():
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
     assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
-    assert slices[0].chunk == ChunkCoords(block_offset=0, block_count=4)
-    assert slices[1].chunk == ChunkCoords(block_offset=4, block_count=4)
+    # Default tokens_per_block is 1, so the token range doubles as block coords.
+    assert slices[0].token_range == TokenRange(start=0, end=4)
+    assert slices[1].token_range == TokenRange(start=4, end=8)
 
 
 def test_send_prefill_chunks_preserves_mamba_state_index():

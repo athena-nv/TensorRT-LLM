@@ -25,10 +25,10 @@ import torch
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import (
-    ChunkCoords,
     KVSlice,
     RxSessionBase,
     SessionStatus,
+    TokenRange,
     TxSessionBase,
     WaitResult,
     get_unique_rid,
@@ -763,12 +763,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             for block_ids in all_block_ids
         ]
+        # The window travels to the sender in token space. Both bounds are
+        # block-aligned by construction, which is the precondition the sender
+        # asserts before dividing them back into block coordinates.
         return KVSlice(
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
             mamba_state_index=base_slice.mamba_state_index,
             total_blocks=total_blocks,
-            chunk=ChunkCoords(block_offset=chunk_start, block_count=chunk_block_count),
+            token_range=TokenRange(start=chunk_start * tpb, end=chunk_end * tpb),
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")

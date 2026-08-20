@@ -42,20 +42,28 @@ def project_blocks_to_global_chunk(
 
 
 @dataclass
-class ChunkCoords:
-    """Position of one pipelined chunk in a request's global block space.
+class TokenRange:
+    """Half-open token range [start, end) within one request.
 
-    Its presence on a ``KVSlice`` is what makes the slice a chunk: only
-    ``_build_prefill_chunk`` produces it, so a monolithic transfer keeps its
-    whole-request addressing untouched.
+    On a ``KVSlice`` this carries one pipelined chunk's window, and its presence
+    is what makes the slice a chunk: only ``_build_prefill_chunk`` produces it,
+    so a monolithic transfer keeps its whole-request addressing untouched.
+
+    Both bounds are block-aligned multiples of ``tokens_per_block``, because the
+    chunk window is decided in block space (the reuse-prefix extension back to
+    block 0, the round up to the enclosing block, the clamp to the prompt) and
+    the sender divides it back out. An empty range is legal: a chunk clamped
+    past the end of the prompt covers no blocks.
     """
 
-    block_offset: int
-    block_count: int  # may be 0 for a chunk that falls entirely inside a reused prefix
+    start: int
+    end: int  # exclusive
 
     def __post_init__(self):
-        if self.block_offset < 0 or self.block_count < 0:
-            raise ValueError(f"Invalid chunk: offset={self.block_offset}, count={self.block_count}")
+        if self.start < 0 or self.end < 0:
+            raise ValueError("Token indices must be non-negative")
+        if self.start > self.end:
+            raise ValueError(f"Invalid range: [{self.start}, {self.end})")
 
 
 @dataclass
@@ -77,16 +85,16 @@ class KVSlice:
     """A KV cache slice of one request.
 
     A single-slice transfer covers the whole request: is_last_slice=True and no
-    ``chunk``, with the extent taken from the session's ``prompt_len``. A
-    pipelined chunk sets ``chunk``, its position in the request's block space.
-    Chunk geometry is decided once by the producer — the reuse-prefix extension
-    back to block 0, the round up to the enclosing block, the clamp to
-    ``total_blocks`` — so the sender reads it rather than rederiving it from
-    token bounds.
+    ``token_range``, with the extent taken from the session's ``prompt_len``. A
+    pipelined chunk sets ``token_range``, its window in the request's token
+    space. Chunk geometry is decided once by the producer — the reuse-prefix
+    extension back to block 0, the round up to the enclosing block, the clamp to
+    ``total_blocks`` — so the range is block-aligned and the sender reads it
+    rather than rederiving a window from the scheduler's token bounds.
 
     Per-layer token starts are not carried — the sender derives them from the
     block count:
-        suffix_end      = chunk.block_offset + chunk.block_count, or total_blocks
+        suffix_end      = token_range.end // tpb, or total_blocks
         token_start_i   = (suffix_end - len(block_ids_per_layer_groups[i])) * tpb
     Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
     block list. Beam search keeps this field 1-D: beam 0's blocks first,
@@ -103,7 +111,7 @@ class KVSlice:
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
     total_blocks: Optional[int] = None
-    chunk: Optional[ChunkCoords] = None
+    token_range: Optional[TokenRange] = None
 
 
 class SessionStatus(Enum):
@@ -202,8 +210,8 @@ class TxSessionBase(_SessionBase):
 
         Args:
             slice: The KV slice describing which source blocks to send.
-                For pipelined chunks, ``chunk`` is the shared sender-side chunk
-                cursor; each layer group projects it into its own
+                For pipelined chunks, ``token_range`` is the shared sender-side
+                chunk cursor; each layer group projects it into its own
                 resident/windowed source and destination block ranges.
         """
         ...
