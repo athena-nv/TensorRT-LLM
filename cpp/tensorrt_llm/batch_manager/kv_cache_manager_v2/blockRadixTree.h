@@ -285,6 +285,10 @@ public:
         // Internal diagnostic: prefix after initial attention-page checks and
         // before recurrent-state and SWA-window pruning.
         int numTokensBeforeHybridPruning;
+        // Raw token-path walk depth, before any pruning. Locates where this
+        // request's content diverges from the tree, independent of page
+        // residency. Equal to numLookupTokens when there is no fork.
+        int numTokensBeforePruning;
     };
 
     ReuseMatch match(
@@ -328,6 +332,7 @@ private:
     {
         std::vector<MatchResult> matches;
         int numTokensBeforeHybridPruning;
+        int numTokensBeforePruning;
     };
 
     std::vector<MatchResult> matchTokenPath(

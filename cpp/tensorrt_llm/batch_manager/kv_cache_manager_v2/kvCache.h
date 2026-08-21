@@ -326,6 +326,11 @@ public:
         return mNumTokensBeforeHybridPruning;
     }
 
+    int numTokensBeforePruning() const noexcept
+    {
+        return mNumTokensBeforePruning;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -615,6 +620,7 @@ private:
 
     std::vector<TokenIdExt> mCommittedTokens;
     int mNumTokensBeforeHybridPruning;
+    int mNumTokensBeforePruning;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

@@ -63,6 +63,9 @@ class _PrefixReuseDiagnostics(Protocol):
     def _get_num_tokens_before_hybrid_pruning(self) -> int:
         ...
 
+    def _get_num_tokens_before_pruning(self) -> int:
+        ...
+
 
 # Replay kernels pad the token/window dimension to at least 16 for tensor-core
 # tiles, so history sizes below 16 are no faster when not writing and do
@@ -2812,6 +2815,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._recurrent_onboarded_blocks_total = 0
         self._recurrent_dropped_blocks_total = 0
         self._recurrent_status_logged = False
+        # Branch points keyed by request id. prepare_expect_snapshot_points()
+        # overwrites the per-request list on every scheduler pass, so the point
+        # has to be re-merged from here rather than stored only on the request.
+        self._branch_snapshot_points: Dict[int, int] = {}
+        self._snapshot_pruned_tokens_total = 0
+        self._page_pruned_tokens_total = 0
+        self._branch_snapshots_taken_total = 0
+        self._branch_snapshots_skipped_total: Dict[str, int] = {}
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
@@ -3006,9 +3017,96 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"request_total_tokens={request_total_tokens} "
                 f"longest_attention_match_tokens="
                 f"{prefix_reuse_diagnostics._get_num_tokens_before_hybrid_pruning()} "
+                f"content_divergence_tokens="
+                f"{prefix_reuse_diagnostics._get_num_tokens_before_pruning()} "
                 f"latest_recurrent_snapshot_tokens="
                 f"{kv_cache.num_committed_tokens}")
         return kv_cache
+
+    def _skip_branch_snapshot(self, reason: str) -> None:
+        self._branch_snapshots_skipped_total[reason] = (
+            self._branch_snapshots_skipped_total.get(reason, 0) + 1)
+
+    def _format_branch_snapshot_counters(self) -> str:
+        """Attribute reuse loss between missing snapshots and evicted pages.
+
+        A flat cache hit rate means something different depending on whether
+        branch points were never found or were found and not reused, so the
+        skip reasons are reported alongside the totals.
+        """
+        skipped = self._branch_snapshots_skipped_total
+        return (f"snapshot_pruned_tokens={self._snapshot_pruned_tokens_total} "
+                f"page_pruned_tokens={self._page_pruned_tokens_total} "
+                f"branch_snapshots_taken={self._branch_snapshots_taken_total} "
+                f"branch_snapshots_skipped={sum(skipped.values())} "
+                f"branch_snapshots_skipped_by_reason="
+                f"{dict(sorted(skipped.items()))}")
+
+    def _record_branch_snapshot_point(self, req: LlmRequest, kv_cache: _KVCache,
+                                      num_lookup_tokens: Optional[int]) -> None:
+        """Snapshot where this request leaves the reuse tree, for its siblings."""
+        if not self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
+            return
+        if self.local_num_mamba_layers == 0 or req.is_dummy_request:
+            return
+        if num_lookup_tokens is None:
+            self._skip_branch_snapshot("no_fresh_match")
+            return
+
+        diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
+        hybrid_depth = diagnostics._get_num_tokens_before_hybrid_pruning()
+        divergence = diagnostics._get_num_tokens_before_pruning()
+        reused = kv_cache.num_committed_tokens
+        # Loss attributable to a missing recurrent snapshot, versus loss
+        # attributable to attention pages having been evicted. These call for
+        # different fixes, so they are counted apart.
+        self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
+        self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
+
+        # The whole lookup range matched, so there is no fork here.
+        if divergence >= num_lookup_tokens:
+            self._skip_branch_snapshot("no_divergence")
+            return
+        # Align down: tokens past a block boundary come from a partial-match
+        # child rather than a confirmed shared prefix, and an unaligned commit
+        # takes the partial-block snapshot path.
+        point = (divergence // self.tokens_per_block) * self.tokens_per_block
+        if point == 0:
+            self._skip_branch_snapshot("aligned_to_zero")
+            return
+        # Reuse already reached the fork, so a snapshot there exists.
+        if point <= req.context_current_position:
+            self._skip_branch_snapshot("already_reused")
+            return
+        # The prompt end is snapshotted unconditionally anyway.
+        if point >= req.prompt_len:
+            self._skip_branch_snapshot("at_prompt_end")
+            return
+
+        self._branch_snapshot_points[req.py_request_id] = point
+        self._branch_snapshots_taken_total += 1
+        self._apply_branch_snapshot_point(req)
+
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        super().prepare_expect_snapshot_points(requests)
+        if (not self.enable_block_reuse or not self.kv_cache_config.
+                mamba_state_config.enable_branch_snapshot):
+            return
+        for request in requests:
+            self._apply_branch_snapshot_point(request)
+
+    def _apply_branch_snapshot_point(self, request: LlmRequest) -> None:
+        # prompt_len is unioned in unconditionally: try_commit_blocks derives
+        # commit_limit from max(snapshot_points), so a lone branch point below
+        # the prompt end would silently stop commits there and lose the
+        # prompt-end snapshot. It also makes the flag usable on its own.
+        points = set(request.expect_snapshot_points)
+        points.add(request.prompt_len)
+        point = self._branch_snapshot_points.get(request.py_request_id)
+        if point is not None and point > request.context_current_position:
+            points.add(point)
+        request.expect_snapshot_points = sorted(points)
 
     def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
         """Log recurrent-cache movement; this is KDA state for Kimi K3."""
@@ -3069,7 +3167,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"host_used_recurrent_blocks="
                 f"{sum(stat.secondary_used_num_blocks for stat in stats)} "
                 f"host_free_recurrent_blocks="
-                f"{sum(stat.secondary_free_num_blocks for stat in stats)}")
+                f"{sum(stat.secondary_free_num_blocks for stat in stats)} "
+                f"{self._format_branch_snapshot_counters()}")
             self._recurrent_status_logged = True
         return report
 
@@ -3470,6 +3569,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.try_commit_blocks(request, kv_cache)
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
+        self._branch_snapshot_points.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -3687,4 +3787,5 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self._branch_snapshot_points.clear()
         super().shutdown()

@@ -59,12 +59,19 @@ class ReuseMatch(NamedTuple):
     recurrent-snapshot and SWA-window constraints are applied together. For
     Kimi K3, which uses full attention, the attention life cycles hold MLA cache
     pages.
+
+    ``num_tokens_before_pruning`` is the raw token-path walk depth, before any
+    pruning at all. It locates where this request's content diverges from the
+    tree, independent of which pages happen to still be resident, so
+    ``num_tokens_before_pruning == num_lookup_tokens`` means the whole lookup
+    range matched and there is no fork here.
     """
 
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
     num_tokens_before_hybrid_pruning: int
+    num_tokens_before_pruning: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -515,9 +522,14 @@ class BlockRadixTree:
                 block = partial_block
                 yield block, match_len
 
-    def _prune_match(self, matched: list[tuple[Block, int]]) -> tuple[list[tuple[Block, int]], int]:
+    def _prune_match(
+        self, matched: list[tuple[Block, int]]
+    ) -> tuple[list[tuple[Block, int]], int, int]:
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
+
+        # Content-divergence depth: measured before anything is pruned away.
+        num_tokens_before_pruning = self._num_matched_tokens(matched)
 
         life_cycles = self._life_cycles
 
@@ -597,7 +609,7 @@ class BlockRadixTree:
                     break
             else:
                 break
-        return matched, num_tokens_before_hybrid_pruning
+        return matched, num_tokens_before_hybrid_pruning, num_tokens_before_pruning
 
     def match(
         self,
@@ -611,7 +623,11 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched, num_tokens_before_hybrid_pruning = self._prune_match(
+        (
+            matched,
+            num_tokens_before_hybrid_pruning,
+            num_tokens_before_pruning,
+        ) = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
         return ReuseMatch(
@@ -619,6 +635,7 @@ class BlockRadixTree:
             self._num_matched_tokens(matched),
             len(tokens),
             num_tokens_before_hybrid_pruning,
+            num_tokens_before_pruning,
         )
 
     def _check_sanity(self) -> bool:

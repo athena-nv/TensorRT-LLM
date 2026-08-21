@@ -737,6 +737,9 @@ BlockRadixTree::PrunedMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> 
         || std::all_of(matched.begin(), matched.end() - 1,
             [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
+    // Content-divergence depth: measured before anything is pruned away.
+    int const numTokensBeforePruning = numMatchedTokens(matched, mTokensPerBlock);
+
     auto attnLcs = mLifeCycles.attentionLifeCycles();
 
     // Full-attention layers require pages on every matched block.
@@ -854,7 +857,7 @@ BlockRadixTree::PrunedMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> 
         }
     }
 
-    return {std::move(matched), numTokensBeforeHybridPruning};
+    return {std::move(matched), numTokensBeforeHybridPruning, numTokensBeforePruning};
 }
 
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
@@ -866,6 +869,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
     result.numTokensBeforeHybridPruning = prunedMatch.numTokensBeforeHybridPruning;
+    result.numTokensBeforePruning = prunedMatch.numTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {
